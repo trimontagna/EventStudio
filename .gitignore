@@ -1,0 +1,5 @@
+build/
+build_*/
+.vs/
+*_layout.ini
+openeb_env.bat
