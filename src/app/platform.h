@@ -24,4 +24,7 @@ std::string format_time_us(long long us);                    // "00:01:23.456"
 
 void reveal_in_explorer(const std::filesystem::path &path);
 
+// Per-user settings folder: %LOCALAPPDATA%\EventStudio (outside the repository).
+std::filesystem::path app_data_dir();
+
 } // namespace evs::app

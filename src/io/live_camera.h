@@ -14,6 +14,7 @@
 
 #include "core/evt_encoder.h"
 #include "core/filters.h"
+#include "core/latency_monitor.h"
 #include "core/mask_set.h"
 #include "core/rate_meter.h"
 #include "core/types.h"
@@ -133,8 +134,12 @@ public:
     double erc_input_rate() const;
     double erc_output_rate() const;
     std::string take_runtime_error();
+    // Camera -> PC delay, from the last decoded camera timestamp of every received buffer (see LatencyMonitor).
+    LatencyMonitor &latency() { return latency_; }
+    const LatencyMonitor &latency() const { return latency_; }
 
-    static timestamp wall_us();
+    static timestamp wall_us();      // PC steady clock, us
+    static std::int64_t unix_us();   // PC system clock, us since 1970 (UTC)
 
 private:
     std::unique_ptr<Metavision::Camera> camera_;
@@ -149,6 +154,7 @@ private:
     std::filesystem::path raw_recording_path_;
 
     RateMeter bytes_meter_, events_meter_, erc_in_meter_, erc_out_meter_;
+    LatencyMonitor latency_;
     std::atomic<bool> erc_counters_seen_{false};
     mutable std::mutex error_mutex_;
     std::string runtime_error_;

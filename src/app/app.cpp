@@ -35,6 +35,7 @@ App::App() {
     record_path_ = to_utf8(default_output_path("recording", ".raw"));
     export_path_ = to_utf8(default_output_path("export", ".raw"));
     prepare_engine(kDefaultWidth, kDefaultHeight);
+    load_app_settings();
     log("EventStudio ready. " + std::to_string(camera_list_.size()) + " camera(s) detected." +
         (samples_dir_.empty() ? " OpenEB samples not found." : " OpenEB samples: " + to_utf8(samples_dir_)));
 }
@@ -120,6 +121,12 @@ void App::on_events(const EventCD *begin, const EventCD *end) {
         // Triggers of the same decoded buffer may arrive after these events: keep a margin before encoding.
         processed_writer_.advance(t - 20'000 - pipeline_->holding_time());
     }
+    if (source_ == SourceKind::File) {
+        const double speed = player_.speed();
+        if (speed > 0 && player_.is_playing())
+            playback_latency_.add(static_cast<timestamp>(std::llround(t / speed)), LiveCamera::wall_us(),
+                                  LiveCamera::unix_us());
+    }
     total_events_ += static_cast<uint64_t>(end - begin);
     last_event_t_    = t;
     last_event_wall_ = LiveCamera::wall_us();
@@ -132,6 +139,7 @@ void App::on_triggers(const EventExtTrigger *begin, const EventExtTrigger *end) 
 }
 
 void App::on_seek(timestamp t) {
+    playback_latency_.reset();
     pipeline_->reset();
     renderer_->reset();
     in_meter_.reset();
@@ -153,7 +161,11 @@ timestamp App::preview_time() const {
 void App::open_camera() {
     close_source();
     refresh_camera_list();
-    const std::string serial = camera_list_.empty() ? std::string() : camera_list_[camera_index_];
+    open_camera_serial(camera_list_.empty() ? std::string() : camera_list_[camera_index_]);
+}
+
+void App::open_camera_serial(const std::string &serial) {
+    close_source();
     camera_.set_events_callback([this](const EventCD *b, const EventCD *e) { on_events(b, e); });
     camera_.set_triggers_callback([this](const EventExtTrigger *b, const EventExtTrigger *e) { on_triggers(b, e); });
     std::string error;
@@ -167,12 +179,143 @@ void App::open_camera() {
     if (camera_format_ != EvtFormat::Evt2)
         processed_format_ = camera_format_;
     read_camera_state();
-    biases_at_open_ = biases_;
+    biases_at_open_ = biases_; // what the camera came up with, before the saved settings are restored
+    restore_camera_settings();
     masks_changed(false);
     apply_hardware_masks();
     log("Opened camera " + camera_.serial() + " (" + camera_.sensor() + ", " + std::to_string(width_) + "x" +
         std::to_string(height_) + ", " + camera_.format_string() + ")");
     start_camera();
+}
+
+void App::reset_camera() {
+    if (source_ != SourceKind::Camera)
+        return;
+    const std::string serial = camera_.serial();
+    if (recording())
+        log("Recording stopped by the camera reset", true);
+    save_camera_settings(); // current settings, restored after reopening
+    log("Resetting camera " + serial + " (discarding the buffered data)...");
+    const auto t0 = std::chrono::steady_clock::now();
+    open_camera_serial(serial);
+    if (source_ == SourceKind::Camera) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "Camera reset in %.1f s",
+                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        log(buf);
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ saved settings
+
+std::filesystem::path App::camera_settings_path() const {
+    return app_data_dir() / "cameras" / camera_settings_file_name(camera_.serial());
+}
+
+CameraSettings App::current_camera_settings() const {
+    CameraSettings s;
+    for (const auto &b : biases_)
+        if (b.modifiable)
+            s.biases[b.name] = b.value;
+    if (erc_.available) {
+        s.has_erc     = true;
+        s.erc_enabled = erc_.enabled;
+        s.erc_rate    = erc_.rate;
+    }
+    if (trail_.available) {
+        s.has_trail          = true;
+        s.trail_enabled      = trail_.enabled;
+        s.trail_mode         = trail_.mode;
+        s.trail_threshold_us = trail_.threshold;
+    }
+    if (trigger_in_.available)
+        for (const auto &[name, id, enabled] : trigger_in_.channels)
+            s.trigger_in[name] = enabled;
+    return s;
+}
+
+void App::apply_camera_settings(const CameraSettings &s) {
+    std::string error;
+    for (const auto &b : biases_) {
+        const auto it = s.biases.find(b.name);
+        if (it == s.biases.end() || !b.modifiable || it->second == b.value)
+            continue;
+        if (!camera_.set_bias(b.name, it->second, &error))
+            log("Restoring " + b.name + ": " + error, true);
+    }
+    if (s.has_erc && erc_.available) {
+        const uint32_t rate = std::clamp(s.erc_rate, erc_.min_rate, std::max(erc_.min_rate, erc_.max_rate));
+        if (!camera_.set_erc(s.erc_enabled, rate, &error))
+            log("Restoring the ERC: " + error, true);
+    }
+    if (s.has_trail && trail_.available) {
+        const TrailMode mode = trail_.modes.count(s.trail_mode) ? s.trail_mode : trail_.mode;
+        const uint32_t threshold =
+            std::clamp(s.trail_threshold_us, trail_.min_threshold, std::max(trail_.min_threshold, trail_.max_threshold));
+        if (!camera_.set_trail(s.trail_enabled, mode, threshold, &error))
+            log("Restoring the trail filter: " + error, true);
+    }
+    if (trigger_in_.available)
+        for (const auto &[name, id, enabled] : trigger_in_.channels) {
+            const auto it = s.trigger_in.find(name);
+            if (it != s.trigger_in.end() && it->second != enabled && !camera_.set_trigger_in(name, it->second, &error))
+                log("Restoring trigger input " + name + ": " + error, true);
+        }
+    read_camera_state();
+}
+
+void App::restore_camera_settings() {
+    const auto path = camera_settings_path();
+    KeyValueFile file;
+    if (file.load(path)) {
+        apply_camera_settings(CameraSettings::from_file(file));
+        log("Restored the settings last given to camera " + camera_.serial() + " (" + to_utf8(path) + ")");
+        camera_settings_dirty_ = false;
+        return;
+    }
+    // First time this camera is seen on this PC: defaults.
+    if (erc_.available) {
+        constexpr uint32_t kDefaultErcRate = 40'000'000;
+        const uint32_t rate = std::clamp(kDefaultErcRate, erc_.min_rate, std::max(erc_.min_rate, erc_.max_rate));
+        std::string error;
+        if (camera_.set_erc(true, rate, &error))
+            log("Event Rate Controller enabled at " + human_rate(rate, "ev") + " (default)");
+        else
+            log("ERC: " + error, true);
+        read_camera_state();
+    }
+    save_camera_settings();
+}
+
+void App::camera_settings_changed() {
+    camera_settings_dirty_      = true;
+    camera_settings_changed_at_ = ImGui::GetTime();
+}
+
+void App::save_camera_settings() {
+    camera_settings_dirty_ = false;
+    if (source_ != SourceKind::Camera && !camera_.is_open())
+        return;
+    std::string error;
+    if (!current_camera_settings().to_file(camera_.serial()).save(camera_settings_path(), &error))
+        log("Cannot save the camera settings: " + error, true);
+}
+
+void App::load_app_settings() {
+    KeyValueFile file;
+    if (!file.load(app_data_dir() / "settings.ini"))
+        return;
+    if (const auto last = file.get("last_recording"); last && !last->empty())
+        last_recording_ = from_utf8(*last);
+}
+
+void App::save_app_settings() {
+    KeyValueFile file;
+    file.header = "EventStudio settings (local to this PC)";
+    file.set("last_recording", to_utf8(last_recording_));
+    std::string error;
+    if (!file.save(app_data_dir() / "settings.ini", &error))
+        log("Cannot save the settings: " + error, true);
 }
 
 void App::reopen_camera_with_format(EvtFormat format) {
@@ -209,8 +352,11 @@ void App::stop_camera() {
 void App::close_source() {
     if (recording())
         stop_recording();
-    if (source_ == SourceKind::Camera)
+    if (source_ == SourceKind::Camera) {
+        if (camera_settings_dirty_)
+            save_camera_settings();
         camera_.close();
+    }
     else if (source_ == SourceKind::File)
         player_.close();
     source_ = SourceKind::None;
@@ -226,6 +372,7 @@ void App::open_file(const std::filesystem::path &path) {
     player_.set_events_callback([this](const EventCD *b, const EventCD *e) { on_events(b, e); });
     player_.set_triggers_callback([this](const EventExtTrigger *b, const EventExtTrigger *e) { on_triggers(b, e); });
     player_.set_seek_callback([this](timestamp t) { on_seek(t); });
+    playback_latency_.reset();
     player_.set_raw_bytes_callback(
         [this](size_t n) { file_bytes_meter_.add(static_cast<double>(n), last_event_t_.load()); });
     std::string error;
@@ -303,6 +450,8 @@ void App::start_recording() {
         processed_recording_ = true;
     }
     record_start_   = std::chrono::steady_clock::now();
+    if (source_ == SourceKind::Camera)
+        open_latency_log(path);
     last_recording_ = path;
     record_path_    = to_utf8(path);
     log(std::string("Recording ") + (record_mode_ == RecordMode::Raw ? "sensor stream" : "processed stream") + " to " +
@@ -318,11 +467,97 @@ void App::stop_recording() {
         processed_recording_ = false;
         processed_writer_.close();
     }
+    close_latency_log();
     std::error_code ec;
     const auto size = std::filesystem::file_size(last_recording_, ec);
     log("Recording saved: " + to_utf8(last_recording_) + " (" + human_bytes(static_cast<double>(size)) + ")");
+    save_app_settings();
     // Next recording gets a fresh name.
     record_path_ = to_utf8(unique_path(last_recording_));
+}
+
+// ================================================================================================ camera -> PC delay
+
+void App::open_latency_log(const std::filesystem::path &recording) {
+    close_latency_log();
+    auto path = recording;
+    path.replace_filename(recording.stem().wstring() + L"_latency.csv");
+    latency_log_.open(path, std::ios::out | std::ios::trunc);
+    if (!latency_log_) {
+        log("Cannot write the delay log " + to_utf8(path), true);
+        return;
+    }
+    latency_log_ << "pc_unix_time_us,pc_elapsed_us,camera_time_us,delay_us\n";
+    latency_log_path_     = path;
+    latency_log_start_us_ = LiveCamera::wall_us();
+    latency_log_rows_     = 0;
+    camera_.latency().set_logging(true);
+}
+
+void App::close_latency_log() {
+    if (!latency_log_.is_open())
+        return;
+    poll_latency(); // write the last samples
+    camera_.latency().set_logging(false);
+    latency_log_.close();
+    log("Delay log saved: " + to_utf8(latency_log_path_) + " (" + std::to_string(latency_log_rows_) + " buffers)");
+}
+
+LatencyMonitor *App::active_latency() {
+    if (source_ == SourceKind::Camera && camera_.is_running())
+        return &camera_.latency();
+    if (source_ == SourceKind::File && player_.is_playing() && !player_.at_end() && player_.speed() > 0)
+        return &playback_latency_;
+    return nullptr;
+}
+
+void App::poll_latency() {
+    if (latency_log_.is_open()) {
+        for (const auto &smp : camera_.latency().take_log()) {
+            latency_log_ << smp.unix_us << ',' << (smp.pc_us - latency_log_start_us_) << ',' << smp.camera_us << ','
+                         << smp.delay_us << '\n';
+            ++latency_log_rows_;
+        }
+    }
+    if (source_ == SourceKind::File) {
+        // Pause / play and speed changes restart the pacing: new reference.
+        const bool playing = player_.is_playing();
+        const double speed = player_.speed();
+        if (playing != playback_was_playing_ || speed != playback_speed_seen_)
+            playback_latency_.reset();
+        playback_was_playing_ = playing;
+        playback_speed_seen_  = speed;
+    }
+    LatencyMonitor *monitor = active_latency();
+    if (!monitor) {
+        latency_warning_active_ = false;
+        return;
+    }
+    const auto st = monitor->stats(LiveCamera::wall_us());
+    if (!st.valid)
+        return;
+    char buf[200];
+    if (latency_warn_enabled_ && !latency_warning_active_ && st.current_ms > latency_threshold_ms()) {
+        latency_warning_active_ = true;
+        if (source_ == SourceKind::Camera)
+            std::snprintf(buf, sizeof(buf),
+                          "Stream delay %.0f ms, longer than the %.0f ms accumulation time: the PC is falling behind "
+                          "the camera (Source > Reset camera discards the backlog)",
+                          st.current_ms, latency_threshold_ms());
+        else
+            std::snprintf(buf, sizeof(buf),
+                          "Playback delay %.0f ms, longer than the %.0f ms accumulation time: decoding / filtering "
+                          "cannot keep up with the playback speed",
+                          st.current_ms, latency_threshold_ms());
+        log(buf, true);
+    } else if (latency_warning_active_ && (!latency_warn_enabled_ || st.current_ms < 0.8 * latency_threshold_ms())) {
+        latency_warning_active_ = false;
+        if (latency_warn_enabled_) {
+            std::snprintf(buf, sizeof(buf), "%s delay back to %.0f ms",
+                          source_ == SourceKind::Camera ? "Stream" : "Playback", st.current_ms);
+            log(buf);
+        }
+    }
 }
 
 // ================================================================================================ masks / filters
@@ -642,6 +877,9 @@ void App::frame() {
     }
     poll_export();
     poll_hot_pixel_detection();
+    poll_latency();
+    if (camera_settings_dirty_ && ImGui::GetTime() - camera_settings_changed_at_ > 0.5)
+        save_camera_settings();
 
     const ImGuiIO &io = ImGui::GetIO();
     if (!io.WantTextInput) {
@@ -702,6 +940,11 @@ void App::draw_menu_bar() {
             if (!path.empty())
                 open_file(path);
         }
+        if (ImGui::MenuItem("Open last recording", nullptr, false,
+                            !last_recording_.empty() && !recording() && std::filesystem::exists(last_recording_)))
+            open_file(last_recording_);
+        if (ImGui::MenuItem("Reset camera", nullptr, false, source_ == SourceKind::Camera))
+            reset_camera();
         if (ImGui::MenuItem("Close source", nullptr, false, source_ != SourceKind::None))
             close_source();
         ImGui::Separator();

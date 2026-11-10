@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -9,7 +10,9 @@
 #include <vector>
 
 #include "app/mask_editor.h"
+#include "core/camera_settings.h"
 #include "core/filters.h"
+#include "core/latency_monitor.h"
 #include "core/frame_renderer.h"
 #include "core/hot_pixels.h"
 #include "core/mask_set.h"
@@ -40,11 +43,23 @@ private:
     // ---- sources (app.cpp)
     void refresh_camera_list();
     void open_camera();
+    void open_camera_serial(const std::string &serial); // empty: first available
+    void reset_camera();                                // close + reopen + restore: flushes the stream backlog
     void close_source();
     void start_camera();
     void stop_camera();
     void reopen_camera_with_format(EvtFormat format);
     void read_camera_state();
+
+    // ---- settings kept between sessions (app.cpp), in app_data_dir()
+    std::filesystem::path camera_settings_path() const; // cameras\<serial>.ini
+    CameraSettings current_camera_settings() const;
+    void apply_camera_settings(const CameraSettings &s);
+    void restore_camera_settings();  // on open: saved settings of this serial, or the defaults (ERC 40 Mev/s)
+    void camera_settings_changed();  // saved shortly after (sliders change many times per second)
+    void save_camera_settings();
+    void load_app_settings();
+    void save_app_settings();
     void prepare_engine(int width, int height);
     void on_events(const EventCD *begin, const EventCD *end); // source thread
     void on_triggers(const EventExtTrigger *begin, const EventExtTrigger *end); // source thread
@@ -55,6 +70,16 @@ private:
     void start_recording();
     void stop_recording();
     bool recording() const;
+
+    // ---- camera -> PC delay (app.cpp)
+    void poll_latency();                 // every frame: delay warning, CSV log while recording
+    void open_latency_log(const std::filesystem::path &recording);
+    void close_latency_log();
+    // Delay above which the preview is behind by more than one frame: the preview accumulation time.
+    double latency_threshold_ms() const { return preview_.accumulation_us * 1e-3; }
+    // Monitor of the current source: the camera stream while streaming, the playback while a recording plays
+    // paced (speed > 0); nullptr otherwise.
+    LatencyMonitor *active_latency();
 
     // ---- masks / filters (app.cpp)
     void masks_changed(bool committed);
@@ -84,6 +109,7 @@ private:
     void draw_menu_bar();
     void draw_controls_window();
     void section_source();
+    void section_latency();
     void section_playback();
     void section_recording();
     void section_biases();
@@ -149,6 +175,22 @@ private:
     bool raw_recording_ = false;
     std::chrono::steady_clock::time_point record_start_;
     std::filesystem::path last_recording_;
+
+    // ---- settings kept between sessions
+    bool camera_settings_dirty_       = false;
+    double camera_settings_changed_at_ = 0;
+
+    // ---- camera -> PC delay
+    bool latency_warn_enabled_   = true;
+    bool latency_warning_active_ = false;
+    // Playback: recording time / speed vs PC clock, i.e. how far the playback slips behind the requested pace.
+    LatencyMonitor playback_latency_{500'000};
+    bool playback_was_playing_ = false;
+    double playback_speed_seen_ = -1;
+    std::ofstream latency_log_;          // <recording>_latency.csv while recording a camera
+    std::filesystem::path latency_log_path_;
+    timestamp latency_log_start_us_ = 0;
+    uint64_t latency_log_rows_      = 0;
 
     // ---- preview
     unsigned int frame_tex_ = 0, mask_tex_ = 0;

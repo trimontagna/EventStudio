@@ -110,6 +110,13 @@ std::filesystem::path from_utf8(const std::string &text) {
     return std::filesystem::u8path(text);
 }
 
+std::filesystem::path app_data_dir() {
+    if (const wchar_t *local = _wgetenv(L"LOCALAPPDATA"); local && *local)
+        return std::filesystem::path(local) / L"EventStudio";
+    std::error_code ec;
+    return std::filesystem::temp_directory_path(ec) / L"EventStudio";
+}
+
 std::filesystem::path default_output_path(const char *prefix, const char *extension) {
     std::filesystem::path dir;
     if (const char *profile = std::getenv("USERPROFILE"))
