@@ -37,6 +37,8 @@ add_library(evs_core STATIC
     src/core/raw_file_writer.cpp
     src/core/hot_pixels.cpp
     src/core/ptv_planner.cpp
+    src/core/latency_monitor.cpp
+    src/core/camera_settings.cpp
 )
 target_include_directories(evs_core PUBLIC src)
 target_link_libraries(evs_core PUBLIC MetavisionSDK::base)
@@ -99,6 +101,8 @@ if(EVS_BUILD_TESTS)
         tests/frame_renderer_test.cpp
         tests/rate_meter_test.cpp
         tests/ptv_test.cpp
+        tests/latency_monitor_test.cpp
+        tests/camera_settings_test.cpp
         tests/evt_encoder_test.cpp
         tests/offline_processor_test.cpp
         tests/file_player_test.cpp

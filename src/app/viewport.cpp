@@ -224,11 +224,26 @@ void App::draw_overlay(const ImVec2 &area_min, const ImVec2 &) {
     char buf[256];
     const bool filtering = pipeline_ && pipeline_->is_active();
     const timestamp now  = last_event_t_.load();
+    // Camera -> PC delay, or playback delay behind the requested pace.
+    const auto add_delay_line = [&] {
+        LatencyMonitor *monitor = active_latency();
+        if (!monitor)
+            return;
+        const auto lat = monitor->stats(LiveCamera::wall_us());
+        if (lat.valid) {
+            std::snprintf(buf, sizeof(buf), "Delay        %.1f ms  (max 10 s: %.1f ms)", lat.current_ms,
+                          lat.recent_max_ms);
+            lines.push_back({buf, latency_warn_enabled_ && lat.current_ms > latency_threshold_ms() ? red : normal});
+        } else {
+            lines.push_back({"Delay        measuring...", IM_COL32(170, 170, 170, 255)});
+        }
+    };
 
     if (source_ == SourceKind::Camera) {
         const double data = camera_.data_rate_bytes(), events = camera_.event_rate();
         lines.push_back({"Data rate    " + human_rate(data, "B"), normal});
         lines.push_back({"Event rate   " + human_rate(events, "ev"), normal});
+        add_delay_line();
         if (erc_.available && erc_.enabled) {
             const double in = camera_.erc_input_rate(), out = camera_.erc_output_rate();
             if (in > 0) {
@@ -259,6 +274,10 @@ void App::draw_overlay(const ImVec2 &area_min, const ImVec2 &) {
         lines.push_back({"Data rate    " + human_rate(file_bytes_meter_.rate_per_second(now), "B"), normal});
         const double in = in_meter_.rate_per_second(now), out = out_meter_.rate_per_second(now);
         lines.push_back({"Event rate   " + human_rate(in, "ev"), normal});
+        if (player_.speed() > 0)
+            add_delay_line();
+        else
+            lines.push_back({"Delay        n/a (max speed, no pacing)", IM_COL32(170, 170, 170, 255)});
         if (filtering) {
             std::snprintf(buf, sizeof(buf), "SW filters   %s  (drop %.1f %%)", human_rate(out, "ev").c_str(),
                           in > 0 ? 100.0 * std::max(0.0, 1 - out / in) : 0.0);

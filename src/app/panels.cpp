@@ -70,15 +70,15 @@ void App::draw_controls_window() {
         section_source();
     if (source_ == SourceKind::File && ImGui::CollapsingHeader("Playback"))
         section_playback();
-    if (ImGui::CollapsingHeader("Recording"))
+    if (ImGui::CollapsingHeader("Recording", ImGuiTreeNodeFlags_DefaultOpen))
         section_recording();
-    if (ImGui::CollapsingHeader("Camera biases", ImGuiTreeNodeFlags_DefaultOpen))
+    if (ImGui::CollapsingHeader("Camera biases"))
         section_biases();
     if (ImGui::CollapsingHeader("Hardware filters (sensor ESP)", ImGuiTreeNodeFlags_DefaultOpen))
         section_hardware_filters();
     if (ImGui::CollapsingHeader("Software filters"))
         section_software_filters();
-    if (ImGui::CollapsingHeader("Preview"))
+    if (ImGui::CollapsingHeader("Preview", ImGuiTreeNodeFlags_DefaultOpen))
         section_preview();
     if (ImGui::CollapsingHeader("Process & export"))
         section_export();
@@ -127,11 +127,20 @@ void App::section_source() {
             start_camera();
         }
         ImGui::SameLine();
+        if (ImGui::Button("Reset camera"))
+            reset_camera();
+        ImGui::SetItemTooltip("Closes and reopens the camera, then restores its settings (biases, ERC, trail filter,\n"
+                              "trigger inputs, masks) and restarts streaming. Discards the data buffered in the\n"
+                              "camera and USB driver: use it when the stream is far behind after a saturation\n"
+                              "(much faster than waiting for the backlog). Stops a running recording.");
+        ImGui::SameLine();
         if (ImGui::Button("Close camera"))
             close_source();
         ImGui::TextDisabled("%s  |  %s  |  %dx%d  |  %s", camera_.serial().c_str(), camera_.sensor().c_str(), width_,
                             height_, camera_.format_string().c_str());
     }
+    if (camera_open)
+        section_latency();
 
     ImGui::SeparatorText("Recording file");
     if (ImGui::Button("Open recording...", ImVec2(-1, 0))) {
@@ -139,12 +148,84 @@ void App::section_source() {
         if (!path.empty())
             open_file(path);
     }
+    if (!last_recording_.empty()) {
+        const bool exists = std::filesystem::exists(last_recording_);
+        ImGui::BeginDisabled(!exists || recording());
+        if (ImGui::Button("Open last recording", ImVec2(-1, 0)))
+            open_file(last_recording_);
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("%s%s", to_utf8(last_recording_).c_str(), exists ? "" : "\n(file not found)");
+    }
     if (source_ == SourceKind::File) {
         ImGui::TextWrapped("%s", to_utf8(player_.path().filename()).c_str());
         ImGui::TextDisabled("%s", file_info_.c_str());
         if (ImGui::SmallButton("Close file"))
             close_source();
     }
+}
+
+void App::section_latency() {
+    const bool camera = source_ == SourceKind::Camera;
+    ImGui::SeparatorText(camera ? "Stream delay (camera -> PC)" : "Playback delay");
+    if (!camera)
+        help_marker("How far the playback slips behind the requested pace: every delivered slice pairs the "
+                    "recording time / speed with the PC clock, like the camera delay. It grows when decoding and "
+                    "the software filters cannot keep up with the playback speed (the player then plays slower "
+                    "than asked). Pause, seek and speed changes take a new reference.");
+    else
+        help_marker("How late the camera data reaches EventStudio. The camera only sends relative timestamps (EVT 3.0: "
+                "24-bit microsecond counter since the stream started, no date), so every received buffer is paired "
+                "with the PC clock: offset = PC time - camera time. The smallest offset is the reference and the "
+                "delay is the offset above it, i.e. the delay in excess of the fastest buffer (USB / driver "
+                "buffering, the PC falling behind). The fixed part (exposure to first USB packet) cannot be seen "
+                "this way. Camera and PC clocks drift apart by ~10-50 ppm: reset the reference in long sessions.\n\n"
+                "While recording a camera, <recording>_latency.csv logs every buffer: PC UTC time, PC time since "
+                "the recording started, camera time and delay (us).");
+    LatencyMonitor *monitor = active_latency();
+    if (!monitor) {
+        ImGui::TextDisabled(camera                ? "Start streaming to measure" :
+                            player_.speed() <= 0 ? "Not measured at max speed (no pacing)" :
+                                                   "Play to measure");
+    } else {
+        const timestamp now = LiveCamera::wall_us();
+        const auto st       = monitor->stats(now);
+        if (!st.valid) {
+            ImGui::TextDisabled("Measuring the reference...");
+        } else {
+            const bool late = latency_warn_enabled_ && st.current_ms > latency_threshold_ms();
+            if (late)
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0.35f, 0.35f, 1));
+            ImGui::Text("Current %.1f ms", st.current_ms);
+            if (late)
+                ImGui::PopStyleColor();
+            ImGui::SameLine();
+            ImGui::TextDisabled("|  max 10 s %.1f ms  |  max %.1f ms", st.recent_max_ms, st.max_ms);
+
+            const auto history = monitor->history_ms(now);
+            float top          = latency_warn_enabled_ ? static_cast<float>(latency_threshold_ms()) * 1.2f : 1.f;
+            for (float v : history)
+                top = std::max(top, v * 1.1f);
+            char overlay[64];
+            std::snprintf(overlay, sizeof(overlay), "last %.0f s, 0 - %.0f ms",
+                          monitor->history_window_us() * 1e-6, top);
+            ImGui::PlotLines("##delay_history", history.data(), static_cast<int>(history.size()), 0, overlay, 0.f,
+                             top, ImVec2(-1, 60));
+            ImGui::TextDisabled(camera ? "Reference set %.0f s ago  |  %llu buffers" :
+                                         "Reference set %.0f s ago  |  %llu slices",
+                                st.reference_age_s,
+                                static_cast<unsigned long long>(st.samples));
+        }
+    }
+    char warn_label[96];
+    std::snprintf(warn_label, sizeof(warn_label), "Warn when longer than the accumulation time (%.3g ms)",
+                  latency_threshold_ms());
+    ImGui::Checkbox(warn_label, &latency_warn_enabled_);
+    ImGui::SetItemTooltip("The preview then shows data older than one accumulation window: the delay turns red\n"
+                          "and a warning is logged. Change the accumulation time in the Preview panel.");
+    if (monitor && ImGui::SmallButton("Reset reference"))
+        monitor->reset();
+    if (latency_log_.is_open())
+        ImGui::TextDisabled("Logging to %s", to_utf8(latency_log_path_.filename()).c_str());
 }
 
 void App::section_playback() {
@@ -159,6 +240,7 @@ void App::section_playback() {
     bool loop = player_.loop();
     if (ImGui::Checkbox("Loop", &loop))
         player_.set_loop(loop);
+    section_latency();
     timestamp min_t = 0, max_t = 0;
     if (player_.seek_range(min_t, max_t))
         ImGui::TextDisabled("Duration %s", format_time_us(max_t).c_str());
@@ -212,8 +294,15 @@ void App::section_recording() {
         if (!can_record)
             ImGui::TextDisabled(source_ == SourceKind::File ? "Recording a file: use the Processed mode" :
                                                               "Open and start a camera to record");
-        if (!last_recording_.empty() && ImGui::SmallButton("Show last recording"))
-            reveal_in_explorer(last_recording_);
+        if (!last_recording_.empty()) {
+            if (ImGui::SmallButton("Show last recording"))
+                reveal_in_explorer(last_recording_);
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!std::filesystem::exists(last_recording_));
+            if (ImGui::SmallButton("Open last recording"))
+                open_file(last_recording_);
+            ImGui::EndDisabled();
+        }
     } else {
         if (ImGui::Button("  Stop recording  ", ImVec2(-1, 0)))
             stop_recording();
@@ -262,10 +351,12 @@ void App::section_biases() {
         int v = b.value;
         if (ImGui::SliderInt(label.c_str(), &v, b.min, b.max)) {
             std::string error;
-            if (camera_.set_bias(b.name, v, &error))
+            if (camera_.set_bias(b.name, v, &error)) {
                 b.value = v;
-            else
+                camera_settings_changed();
+            } else {
                 log(error, true);
+            }
         }
         ImGui::EndDisabled();
         if (outside)
@@ -280,14 +371,17 @@ void App::section_biases() {
             ImGui::EndTooltip();
         }
     }
-    if (ImGui::Button("Reset to values at opening")) {
+    if (ImGui::Button("Reset to camera defaults")) {
         for (const auto &b : biases_at_open_) {
             std::string error;
             if (b.modifiable && !camera_.set_bias(b.name, b.value, &error))
                 log(error, true);
         }
         biases_ = camera_.biases();
+        camera_settings_changed();
     }
+    ImGui::SetItemTooltip("Values the camera reported when it was opened, before EventStudio restored the\n"
+                          "settings it last gave this camera (normally the sensor defaults).");
     ImGui::SameLine();
     if (ImGui::Button("Load .bias")) {
         const auto p = open_file_dialog("Load biases", "Bias files|*.bias|All files|*.*");
@@ -295,6 +389,7 @@ void App::section_biases() {
         if (!p.empty()) {
             camera_.load_biases(p, &error) ? log("Biases loaded from " + to_utf8(p)) : log("Load failed: " + error, true);
             biases_ = camera_.biases();
+            camera_settings_changed();
         }
     }
     ImGui::SameLine();
@@ -304,7 +399,8 @@ void App::section_biases() {
         if (!p.empty())
             camera_.save_biases(p, &error) ? log("Biases saved to " + to_utf8(p)) : log("Save failed: " + error, true);
     }
-    ImGui::TextDisabled("Orange: outside the recommended range.");
+    ImGui::TextDisabled("Sliders span the range the sensor allows; orange: outside the recommended range.\n"
+                        "Settings are restored when this camera is opened again.");
 }
 
 void App::section_hardware_filters() {
@@ -330,6 +426,7 @@ void App::section_hardware_filters() {
             if (!camera_.set_erc(enabled, static_cast<uint32_t>(rate), &error))
                 log("ERC: " + error, true);
             erc_ = camera_.erc();
+            camera_settings_changed();
         }
     }
 
@@ -360,6 +457,7 @@ void App::section_hardware_filters() {
             if (!camera_.set_trail(enabled, mode, static_cast<uint32_t>(ms) * 1000, &error))
                 log("Trail filter: " + error, true);
             trail_ = camera_.trail();
+            camera_settings_changed();
         }
     }
 
@@ -368,13 +466,18 @@ void App::section_hardware_filters() {
     if (!trigger_in_.available || trigger_in_.channels.empty()) {
         ImGui::TextDisabled("Not available on this camera");
     } else {
+        bool trigger_changed = false;
         for (auto &[name, id, enabled] : trigger_in_.channels) {
             const std::string label = name + " (id " + std::to_string(id) + ")##tin";
             if (ImGui::Checkbox(label.c_str(), &enabled)) {
                 if (!camera_.set_trigger_in(name, enabled, &error))
                     log("Trigger input " + name + ": " + error, true);
-                trigger_in_ = camera_.trigger_in();
+                trigger_changed = true;
             }
+        }
+        if (trigger_changed) { // read back after the loop: reassigning the vector inside it would invalidate it
+            trigger_in_ = camera_.trigger_in();
+            camera_settings_changed();
         }
         help_marker("Trigger events are kept in raw and processed recordings and in exports.");
         ImGui::TextDisabled("%llu trigger events received", static_cast<unsigned long long>(total_triggers_.load()));

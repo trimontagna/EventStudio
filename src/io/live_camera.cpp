@@ -63,6 +63,12 @@ timestamp LiveCamera::wall_us() {
         .count();
 }
 
+std::int64_t LiveCamera::unix_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
 std::vector<std::string> LiveCamera::list_cameras() {
     std::vector<std::string> serials;
     try {
@@ -77,6 +83,9 @@ bool LiveCamera::open(const std::string &serial, EvtFormat format, std::string *
     return guarded(error, [&] {
         Metavision::DeviceConfig config;
         config.set_format(to_string(format));
+        // Without this OpenEB rejects bias values outside the *recommended* range; with it the whole range the
+        // manufacturer allows for this sensor (LL_Bias_Info::get_bias_allowed_range) can be set.
+        config.enable_biases_range_check_bypass(true);
         camera_ = std::make_unique<Metavision::Camera>(serial.empty() ? Metavision::Camera::from_first_available(config) :
                                                                         Metavision::Camera::from_serial(serial, config));
         width_  = camera_->geometry().get_width();
@@ -116,7 +125,13 @@ bool LiveCamera::open(const std::string &serial, EvtFormat format, std::string *
                 events_cb_(b, e);
         });
         camera_->raw_data().add_callback(
-            [this](const std::uint8_t *, size_t size) { bytes_meter_.add(static_cast<double>(size), wall_us()); });
+            [this](const std::uint8_t *, size_t size) {
+                // Called right after the buffer was decoded: the last decoded timestamp is the camera time at the
+                // end of the buffer (it advances with the time-high words even when no event is sent).
+                const timestamp now = wall_us();
+                bytes_meter_.add(static_cast<double>(size), now);
+                latency_.add(camera_->get_last_timestamp(), now, unix_us());
+            });
         try {
             camera_->ext_trigger().add_callback([this](const EventExtTrigger *b, const EventExtTrigger *e) {
                 if (triggers_cb_ && b != e)
@@ -137,6 +152,7 @@ bool LiveCamera::open(const std::string &serial, EvtFormat format, std::string *
         erc_in_meter_.reset();
         erc_out_meter_.reset();
         erc_counters_seen_ = false;
+        latency_.reset();
         return true;
     });
 }
@@ -159,7 +175,12 @@ bool LiveCamera::is_open() const {
 bool LiveCamera::start(std::string *error) {
     if (!camera_)
         return false;
-    return guarded(error, [&] { return camera_->is_running() || camera_->start(); });
+    return guarded(error, [&] {
+        if (camera_->is_running())
+            return true;
+        latency_.reset(); // the time base restarts with the stream
+        return camera_->start();
+    });
 }
 
 void LiveCamera::stop() {
