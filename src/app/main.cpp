@@ -94,6 +94,7 @@ int main(int argc, char **argv) {
 
         while (!glfwWindowShouldClose(window) && !app.quit_requested()) {
             glfwPollEvents();
+            app.background_tick();
             if (glfwGetWindowAttrib(window, GLFW_ICONIFIED)) {
                 ImGui_ImplGlfw_Sleep(20);
                 continue;

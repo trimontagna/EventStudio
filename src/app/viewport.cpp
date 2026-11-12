@@ -242,7 +242,9 @@ void App::draw_overlay(const ImVec2 &area_min, const ImVec2 &) {
     if (source_ == SourceKind::Camera) {
         const double data = camera_.data_rate_bytes(), events = camera_.event_rate();
         lines.push_back({"Data rate    " + human_rate(data, "B"), normal});
-        lines.push_back({"Event rate   " + human_rate(events, "ev"), normal});
+        lines.push_back({"Event rate   " + human_rate(events, "ev") + "  (mean 10 s: " +
+                             human_rate(event_history_.mean_per_second(LiveCamera::wall_us(), 10'000'000), "ev") + ")",
+                         normal});
         add_delay_line();
         if (erc_.available && erc_.enabled) {
             const double in = camera_.erc_input_rate(), out = camera_.erc_output_rate();
@@ -273,7 +275,9 @@ void App::draw_overlay(const ImVec2 &area_min, const ImVec2 &) {
                          normal});
         lines.push_back({"Data rate    " + human_rate(file_bytes_meter_.rate_per_second(now), "B"), normal});
         const double in = in_meter_.rate_per_second(now), out = out_meter_.rate_per_second(now);
-        lines.push_back({"Event rate   " + human_rate(in, "ev"), normal});
+        lines.push_back({"Event rate   " + human_rate(in, "ev") + "  (mean 10 s: " +
+                             human_rate(event_history_.mean_per_second(now, 10'000'000), "ev") + ")",
+                         normal});
         if (player_.speed() > 0)
             add_delay_line();
         else

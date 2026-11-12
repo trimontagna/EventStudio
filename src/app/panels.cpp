@@ -139,8 +139,10 @@ void App::section_source() {
         ImGui::TextDisabled("%s  |  %s  |  %dx%d  |  %s", camera_.serial().c_str(), camera_.sensor().c_str(), width_,
                             height_, camera_.format_string().c_str());
     }
-    if (camera_open)
+    if (camera_open) {
         section_latency();
+        section_event_rate();
+    }
 
     ImGui::SeparatorText("Recording file");
     if (ImGui::Button("Open recording...", ImVec2(-1, 0))) {
@@ -151,7 +153,7 @@ void App::section_source() {
     if (!last_recording_.empty()) {
         const bool exists = std::filesystem::exists(last_recording_);
         ImGui::BeginDisabled(!exists || recording());
-        if (ImGui::Button("Open last recording", ImVec2(-1, 0)))
+        if (ImGui::Button("Open last recording##source", ImVec2(-1, 0)))
             open_file(last_recording_);
         ImGui::EndDisabled();
         ImGui::SetItemTooltip("%s%s", to_utf8(last_recording_).c_str(), exists ? "" : "\n(file not found)");
@@ -228,6 +230,49 @@ void App::section_latency() {
         ImGui::TextDisabled("Logging to %s", to_utf8(latency_log_path_.filename()).c_str());
 }
 
+void App::section_event_rate() {
+    const bool camera = source_ == SourceKind::Camera;
+    ImGui::SeparatorText("Event rate");
+    help_marker(camera ? "Events received from the camera (before the software filters). Current: last second. The "
+                         "graph shows every 100 ms (PC clock) over the last 60 s; the dashed line is the mean over "
+                         "the last 10 s, as for the max delay, to read a steady level through the noise." :
+                         "Events read from the recording (before the software filters), in recording time. Current: "
+                         "last second. The graph shows every 100 ms over the last 60 s of recording; the dashed line "
+                         "is the mean over the last 10 s.");
+    if (camera && !camera_.is_running()) {
+        ImGui::TextDisabled("Start streaming to measure");
+        return;
+    }
+    if (event_history_.empty()) {
+        ImGui::TextDisabled(camera ? "No events received yet" : "Play to measure");
+        return;
+    }
+    const timestamp now = camera ? LiveCamera::wall_us() : last_event_t_.load();
+    const double live   = camera ? camera_.event_rate() : in_meter_.rate_per_second(now);
+    const double mean   = event_history_.mean_per_second(now, 10'000'000);
+    ImGui::Text("Current %s", human_rate(live, "ev").c_str());
+    ImGui::SameLine();
+    ImGui::TextDisabled("|  mean 10 s %s", human_rate(mean, "ev").c_str());
+
+    const auto history = event_history_.per_second(now);
+    float top          = std::max(1.f, static_cast<float>(mean) * 1.2f);
+    for (float v : history)
+        top = std::max(top, v * 1.1f);
+    char overlay[64];
+    std::snprintf(overlay, sizeof(overlay), "last %.0f s, 0 - %s", event_history_.history_window_us() * 1e-6,
+                  human_rate(top, "ev").c_str());
+    ImGui::PlotLines("##event_rate_history", history.data(), static_cast<int>(history.size()), 0, overlay, 0.f, top,
+                     ImVec2(-1, 60));
+    // Dashed line at the 10 s mean, inside the plot area (the frame minus its padding).
+    const ImVec2 pad = ImGui::GetStyle().FramePadding;
+    const ImVec2 lo(ImGui::GetItemRectMin().x + pad.x, ImGui::GetItemRectMin().y + pad.y);
+    const ImVec2 hi(ImGui::GetItemRectMax().x - pad.x, ImGui::GetItemRectMax().y - pad.y);
+    const float y  = hi.y - static_cast<float>(mean / top) * (hi.y - lo.y);
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    for (float x = lo.x; x < hi.x; x += 9.f)
+        dl->AddLine(ImVec2(x, y), ImVec2(std::min(x + 5.f, hi.x), y), IM_COL32(255, 200, 80, 220), 1.5f);
+}
+
 void App::section_playback() {
     static const float speeds[]      = {0.01f, 0.1f, 0.25f, 0.5f, 1.f, 2.f, 5.f, 10.f, 0.f};
     static const char *speed_names[] = {"0.01x", "0.1x", "0.25x", "0.5x", "1x (real time)", "2x", "5x", "10x",
@@ -241,6 +286,7 @@ void App::section_playback() {
     if (ImGui::Checkbox("Loop", &loop))
         player_.set_loop(loop);
     section_latency();
+    section_event_rate();
     timestamp min_t = 0, max_t = 0;
     if (player_.seek_range(min_t, max_t))
         ImGui::TextDisabled("Duration %s", format_time_us(max_t).c_str());
@@ -269,17 +315,45 @@ void App::section_recording() {
     } else {
         ImGui::TextDisabled("Format: %s (camera stream format)", display_name(camera_format_));
     }
-    ImGui::InputText("File", &record_path_);
+    ImGui::InputText("Folder##rec", &record_dir_);
+    if (ImGui::IsItemDeactivatedAfterEdit())
+        save_app_settings();
     ImGui::SameLine();
-    if (ImGui::SmallButton("...##rec")) {
-        const auto p = save_file_dialog("Record to", "RAW files|*.raw", from_utf8(record_path_), ".raw");
-        if (!p.empty())
-            record_path_ = to_utf8(p);
+    if (ImGui::SmallButton("...##recdir")) {
+        const auto p = pick_folder_dialog("Folder of the recordings", from_utf8(record_dir_));
+        if (!p.empty()) {
+            record_dir_ = to_utf8(p);
+            save_app_settings();
+        }
     }
+    ImGui::SetItemTooltip("Choose the folder (kept between sessions).");
+    ImGui::InputText("File name##rec", &record_name_);
+    ImGui::SameLine();
+    ImGui::TextDisabled(".raw");
     ImGui::SameLine();
     if (ImGui::SmallButton("New name"))
-        record_path_ = to_utf8(default_output_path("recording", ".raw"));
+        record_name_ = to_utf8(default_output_path("recording", ".raw").stem());
+    ImGui::SetItemTooltip("recording_<date>_<time>");
     ImGui::EndDisabled();
+    if (!recording()) {
+        const auto target = record_target();
+        std::error_code ec;
+        if (std::filesystem::exists(target, ec))
+            ImGui::TextDisabled("Exists: will record to %s", to_utf8(unique_path(target).filename()).c_str());
+    }
+
+    if (ImGui::Checkbox("Stop after##rectimed", &record_timed_))
+        save_app_settings();
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 7);
+    ImGui::BeginDisabled(!record_timed_);
+    ImGui::DragFloat("##recduration", &record_duration_s_, 0.1f, 0.1f, 86400.f, "%.1f s",
+                     ImGuiSliderFlags_AlwaysClamp);
+    if (ImGui::IsItemDeactivatedAfterEdit())
+        save_app_settings();
+    ImGui::EndDisabled();
+    help_marker("Timed recording: stops on its own after this duration (PC clock, checked every frame, also while "
+                "the window is minimized). Drag, or double click to type. Can be changed during a recording.");
 
     const bool can_record =
         source_ == SourceKind::Camera ? camera_.is_running() : (source_ == SourceKind::File && mode == 1);
@@ -299,15 +373,14 @@ void App::section_recording() {
                 reveal_in_explorer(last_recording_);
             ImGui::SameLine();
             ImGui::BeginDisabled(!std::filesystem::exists(last_recording_));
-            if (ImGui::SmallButton("Open last recording"))
+            if (ImGui::SmallButton("Open last recording##rec"))
                 open_file(last_recording_);
             ImGui::EndDisabled();
         }
     } else {
         if (ImGui::Button("  Stop recording  ", ImVec2(-1, 0)))
             stop_recording();
-        const double elapsed =
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - record_start_).count();
+        const double elapsed = recording_elapsed_s();
         std::error_code ec;
         const double size = raw_recording_ ? static_cast<double>(std::filesystem::file_size(last_recording_, ec)) :
                                              static_cast<double>(processed_writer_.bytes_written());
@@ -316,6 +389,14 @@ void App::section_recording() {
         ImGui::SameLine();
         ImGui::Text("%s  |  %s", format_time_us(static_cast<long long>(elapsed * 1e6)).c_str(),
                     human_bytes(size).c_str());
+        ImGui::SameLine();
+        ImGui::TextDisabled("|  %s", to_utf8(last_recording_.filename()).c_str());
+        if (record_timed_) {
+            const double f = std::clamp(elapsed / std::max(0.1, static_cast<double>(record_duration_s_)), 0.0, 1.0);
+            char overlay[96];
+            std::snprintf(overlay, sizeof(overlay), "%.1f / %.1f s", elapsed, record_duration_s_);
+            ImGui::ProgressBar(static_cast<float>(f), ImVec2(-1, 0), overlay);
+        }
     }
 }
 
@@ -348,14 +429,51 @@ void App::section_biases() {
         if (outside)
             ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.45f, 0.2f, 0.1f, 1));
         ImGui::BeginDisabled(!b.modifiable);
-        int v = b.value;
-        if (ImGui::SliderInt(label.c_str(), &v, b.min, b.max)) {
+        // Detent at the edges of the recommended range (when inside the allowed one): a drag stops there and
+        // must push on by ~1.25 font sizes to go through. Typed values (Ctrl+click) are not affected.
+        std::vector<int> detents;
+        for (int p : {b.rec_min, b.rec_max})
+            if (p > b.min && p < b.max && b.rec_min < b.rec_max)
+                detents.push_back(p);
+        const float frame_w = ImGui::CalcItemWidth();
+        int v               = b.value;
+        bool changed        = ImGui::SliderInt(label.c_str(), &v, b.min, b.max);
+        const bool active   = ImGui::IsItemActive();
+        if (active && (ImGui::IsItemActivated() || bias_detent_name_ != b.name)) { // a new drag
+            bias_detent_.release();
+            bias_detent_name_ = b.name;
+        } else if (!active && bias_detent_name_ == b.name) { // drag over
+            bias_detent_.release();
+            bias_detent_name_.clear();
+        }
+        if (changed && active && ImGui::IsMouseDown(ImGuiMouseButton_Left) && !detents.empty()) {
+            const float units_per_px = static_cast<float>(b.max - b.min) / std::max(frame_w, 1.f);
+            const int width = std::max(1, static_cast<int>(std::lround(ImGui::GetFontSize() * 1.25f * units_per_px)));
+            v               = bias_detent_.apply(b.value, v, detents, width);
+            changed         = v != b.value;
+        }
+        if (changed) {
             std::string error;
             if (camera_.set_bias(b.name, v, &error)) {
                 b.value = v;
                 camera_settings_changed();
             } else {
                 log(error, true);
+            }
+        }
+        {
+            // Tick marks at the recommended limits, where the grab centre sits for that value.
+            const ImVec2 r0 = ImGui::GetItemRectMin(), r1 = ImGui::GetItemRectMax();
+            const float pad = 2.f; // ImGui's slider grab padding
+            const float range = static_cast<float>(std::max(1, b.max - b.min));
+            const float grab  = std::max((frame_w - 2 * pad) / (range + 1), ImGui::GetStyle().GrabMinSize);
+            const float usable = frame_w - 2 * pad - grab;
+            const bool held    = bias_detent_name_ == b.name && bias_detent_.holding();
+            for (int p : detents) {
+                const float x   = r0.x + pad + grab * 0.5f + usable * static_cast<float>(p - b.min) / range;
+                const ImU32 col = held && bias_detent_.point() == p ? IM_COL32(255, 220, 90, 255) :
+                                                                      IM_COL32(255, 255, 255, 110);
+                ImGui::GetWindowDrawList()->AddLine(ImVec2(x, r0.y + 1), ImVec2(x, r1.y - 1), col, 2.f);
             }
         }
         ImGui::EndDisabled();
@@ -368,6 +486,7 @@ void App::section_biases() {
             if (!b.description.empty())
                 ImGui::TextWrapped("%s", b.description.c_str());
             ImGui::Text("Allowed [%d, %d], recommended [%d, %d]", b.min, b.max, b.rec_min, b.rec_max);
+            ImGui::TextDisabled("Dragging stops at the recommended limits (ticks): push on to go through.");
             ImGui::EndTooltip();
         }
     }
@@ -399,7 +518,8 @@ void App::section_biases() {
         if (!p.empty())
             camera_.save_biases(p, &error) ? log("Biases saved to " + to_utf8(p)) : log("Save failed: " + error, true);
     }
-    ImGui::TextDisabled("Sliders span the range the sensor allows; orange: outside the recommended range.\n"
+    ImGui::TextDisabled("Sliders span the range the sensor allows; ticks: recommended limits, where a drag\n"
+                        "stops (push on to go through); orange: outside the recommended range.\n"
                         "Settings are restored when this camera is opened again.");
 }
 

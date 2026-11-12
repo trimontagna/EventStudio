@@ -38,6 +38,8 @@ add_library(evs_core STATIC
     src/core/hot_pixels.cpp
     src/core/ptv_planner.cpp
     src/core/latency_monitor.cpp
+    src/core/rate_history.cpp
+    src/core/slider_detent.cpp
     src/core/camera_settings.cpp
 )
 target_include_directories(evs_core PUBLIC src)
@@ -102,6 +104,8 @@ if(EVS_BUILD_TESTS)
         tests/rate_meter_test.cpp
         tests/ptv_test.cpp
         tests/latency_monitor_test.cpp
+        tests/rate_history_test.cpp
+        tests/slider_detent_test.cpp
         tests/camera_settings_test.cpp
         tests/evt_encoder_test.cpp
         tests/offline_processor_test.cpp

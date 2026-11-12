@@ -17,8 +17,10 @@
 #include "core/hot_pixels.h"
 #include "core/mask_set.h"
 #include "core/ptv_planner.h"
+#include "core/rate_history.h"
 #include "core/rate_meter.h"
 #include "core/raw_file_writer.h"
+#include "core/slider_detent.h"
 #include "io/file_player.h"
 #include "io/live_camera.h"
 #include "io/offline_processor.h"
@@ -38,6 +40,8 @@ public:
     bool load_masks(const std::filesystem::path &path);
     void shutdown();
     bool quit_requested() const { return quit_requested_; }
+    // Work that must go on while the window is minimized (no frame() then): the timed recording stop.
+    void background_tick();
 
 private:
     // ---- sources (app.cpp)
@@ -70,6 +74,8 @@ private:
     void start_recording();
     void stop_recording();
     bool recording() const;
+    double recording_elapsed_s() const;
+    std::filesystem::path record_target() const; // folder / name.raw, before making it unique
 
     // ---- camera -> PC delay (app.cpp)
     void poll_latency();                 // every frame: delay warning, CSV log while recording
@@ -110,6 +116,7 @@ private:
     void draw_controls_window();
     void section_source();
     void section_latency();
+    void section_event_rate();
     void section_playback();
     void section_recording();
     void section_biases();
@@ -160,6 +167,9 @@ private:
     FilterConfig filters_;
     PreviewSettings preview_;
     RateMeter in_meter_, out_meter_, file_bytes_meter_;
+    // Input events (before the software filters) per 100 ms bin over 60 s: graph and 10 s mean. Camera: PC clock;
+    // file: recording time.
+    RateHistory event_history_;
     std::atomic<timestamp> last_event_t_{0};
     std::atomic<timestamp> last_event_wall_{0};
     std::atomic<uint64_t> total_events_{0};
@@ -169,7 +179,10 @@ private:
     enum class RecordMode { Raw = 0, Processed = 1 };
     RecordMode record_mode_ = RecordMode::Raw;
     EvtFormat processed_format_ = EvtFormat::Evt3;
-    std::string record_path_;
+    std::string record_dir_;  // folder of the recordings (kept between sessions)
+    std::string record_name_; // file name, ".raw" added when missing
+    bool record_timed_        = false;
+    float record_duration_s_  = 10.f;
     RawFileWriter processed_writer_;
     std::atomic<bool> processed_recording_{false};
     bool raw_recording_ = false;
@@ -178,6 +191,8 @@ private:
 
     // ---- settings kept between sessions
     bool camera_settings_dirty_       = false;
+    SliderDetent bias_detent_;
+    std::string bias_detent_name_; // bias whose slider the detent belongs to
     double camera_settings_changed_at_ = 0;
 
     // ---- camera -> PC delay

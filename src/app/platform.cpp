@@ -117,6 +117,18 @@ std::filesystem::path app_data_dir() {
     return std::filesystem::temp_directory_path(ec) / L"EventStudio";
 }
 
+std::filesystem::path unique_path(const std::filesystem::path &p) {
+    std::error_code ec;
+    if (!std::filesystem::exists(p, ec))
+        return p;
+    const std::wstring stem = p.stem().wstring(), ext = p.extension().wstring();
+    for (int i = 1;; ++i) {
+        auto candidate = p.parent_path() / (stem + L"_" + std::to_wstring(i) + ext);
+        if (!std::filesystem::exists(candidate, ec))
+            return candidate;
+    }
+}
+
 std::filesystem::path default_output_path(const char *prefix, const char *extension) {
     std::filesystem::path dir;
     if (const char *profile = std::getenv("USERPROFILE"))
