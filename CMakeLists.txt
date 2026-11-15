@@ -82,6 +82,7 @@ if(EVS_BUILD_APP)
         src/app/mask_editor.cpp
         src/app/panels.cpp
         src/app/platform.cpp
+        src/app/launch_console.cpp
     )
 endif()
 if(EVS_BUILD_APP)

@@ -10,6 +10,7 @@
 #include <imgui_impl_opengl3.h>
 
 #include "app/app.h"
+#include "app/launch_console.h"
 
 namespace {
 
@@ -55,6 +56,7 @@ void setup_style(float scale) {
 } // namespace
 
 int main(int argc, char **argv) {
+    evs::app::launch_console::hide(); // the window of a double-clicked EventStudio.bat
     glfwSetErrorCallback(glfw_error_callback);
     if (!glfwInit())
         return 1;
@@ -83,9 +85,11 @@ int main(int argc, char **argv) {
 
     {
         evs::app::App app;
-        // EventStudio [recording] [--masks file.masks]
+        // EventStudio [recording] [--masks file.masks] [--console]
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
+            if (arg == "--console")
+                continue; // keep the console of EventStudio.bat (launch_console)
             if (arg == "--masks" && i + 1 < argc)
                 app.load_masks(std::filesystem::u8path(argv[++i]));
             else
@@ -124,5 +128,6 @@ int main(int argc, char **argv) {
     ImGui::DestroyContext();
     glfwDestroyWindow(window);
     glfwTerminate();
+    evs::app::launch_console::close();
     return 0;
 }

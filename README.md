@@ -45,11 +45,15 @@ C:\Dev\
 |---|---|
 | `build.bat [target]` | Configures (first time) and builds into `build\` (Release, with PDBs) |
 | `run_tests.bat [gtest args]` | Runs the unit / integration tests (`build\Release\evs_tests.exe`) |
-| `EventStudio.bat [file] [--masks file.masks]` | Starts the application, optionally opening a recording |
+| `EventStudio.bat [file] [--masks file.masks] [--console]` | Starts the application, optionally opening a recording |
 
 `EventStudio.exe` must run with the OpenEB environment (`EventStudio.bat` sets it): it loads the OpenEB DLLs and
 camera plugins from the OpenEB build tree. Integration tests use the OpenEB test datasets in
 `C:\Dev\OpenEB_tests\openeb` (`EVS_TEST_DATA_DIR` in `build.bat`); without them those tests are skipped.
+
+Double-clicked, `EventStudio.bat` waits for the application: its console window is hidden once EventStudio starts and
+closed when it ends (also in Windows Terminal, whatever its `closeOnExit` setting). Run from a terminal (cmd, PowerShell),
+the terminal is left as it is and its prompt comes back when EventStudio closes; `--console` keeps the window.
 
 ## Features
 
