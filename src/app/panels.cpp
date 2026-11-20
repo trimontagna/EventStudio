@@ -735,6 +735,11 @@ void App::section_preview() {
     ImGui::Checkbox("Rate overlay", &show_overlay_);
     ImGui::SameLine();
     ImGui::Checkbox("Mask fill", &show_mask_fill_);
+    ImGui::SameLine();
+    ImGui::Checkbox("Measure", &measure_);
+    ImGui::SetItemTooltip("Measure on the preview (M): click a first pixel, then a second one (Shift: horizontal /\n"
+                          "vertical). Step the time in between (arrow keys) for the pixel speed, from the times the\n"
+                          "points were set at. Right click or Esc clears. Mask editing is off meanwhile.");
     ImGui::TextDisabled("Wheel: zoom, middle drag: pan, middle double click: fit.");
 }
 

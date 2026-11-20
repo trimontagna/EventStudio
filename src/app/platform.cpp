@@ -169,13 +169,17 @@ std::string human_rate(double per_second, const char *unit) {
     return buf;
 }
 
-std::string format_time_us(long long us) {
+std::string format_time_us(long long us, bool micro) {
     const bool neg = us < 0;
     if (neg)
         us = -us;
     const long long ms = us / 1000, s = ms / 1000, m = s / 60, h = m / 60;
     char buf[48];
-    std::snprintf(buf, sizeof(buf), "%s%02lld:%02lld:%02lld.%03lld", neg ? "-" : "", h, m % 60, s % 60, ms % 1000);
+    if (micro)
+        std::snprintf(buf, sizeof(buf), "%s%02lld:%02lld:%02lld.%06lld", neg ? "-" : "", h, m % 60, s % 60,
+                      us % 1'000'000);
+    else
+        std::snprintf(buf, sizeof(buf), "%s%02lld:%02lld:%02lld.%03lld", neg ? "-" : "", h, m % 60, s % 60, ms % 1000);
     return buf;
 }
 

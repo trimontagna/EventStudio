@@ -35,6 +35,7 @@ bool FilePlayer::open(const std::filesystem::path &path, std::string *error) {
         last_seek_refresh_ = {};
         seek_request_.reset();
         preview_until_.reset();
+        target_.reset();
         status_.clear();
     }
     thread_ = std::thread(&FilePlayer::run, this);
@@ -76,6 +77,7 @@ void FilePlayer::play() {
         if (!source_)
             return;
         playing_ = true;
+        target_.reset();
     }
     cv_.notify_all();
 }
@@ -107,8 +109,36 @@ void FilePlayer::request_seek(timestamp t, timestamp preroll_us) {
         std::lock_guard<std::mutex> lock(mutex_);
         seek_request_  = std::max<timestamp>(0, t - std::max<timestamp>(0, preroll_us));
         preview_until_ = t;
+        target_        = t;
     }
     cv_.notify_all();
+}
+
+bool FilePlayer::advance_to(timestamp t) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!source_ || playing_ || at_end_ || seek_request_ || t <= (target_ ? *target_ : current_t_.load()))
+            return false;
+        preview_until_ = t;
+        target_        = t;
+    }
+    cv_.notify_all();
+    return true;
+}
+
+timestamp FilePlayer::position() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return !playing_ && target_ ? *target_ : current_t_.load();
+}
+
+bool FilePlayer::target_pending() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return !playing_ && target_ && (seek_request_ || preview_until_);
+}
+
+bool FilePlayer::target_reached() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return !playing_ && target_ && !seek_request_ && !preview_until_;
 }
 
 bool FilePlayer::seek_range(timestamp &min_t, timestamp &max_t) const {
@@ -168,14 +198,16 @@ void FilePlayer::set_status(std::string s) {
     status_ = std::move(s);
 }
 
-FilePlayer::Wait FilePlayer::wait_until_due(timestamp t) {
+FilePlayer::Wait FilePlayer::wait_until_due(timestamp t, timestamp &limit) {
     std::unique_lock<std::mutex> lock(mutex_);
     for (;;) {
         if (stop_ || seek_request_)
             return Wait::Abort;
         if (preview_until_) {
-            if (t <= *preview_until_)
-                return Wait::Proceed; // seek preroll: no pacing
+            if (t <= *preview_until_) {
+                limit = std::min(limit, *preview_until_ + 1); // up to the target exactly, not a slice beyond
+                return Wait::Proceed;                         // seek preroll: no pacing
+            }
             preview_until_.reset();
             pace_valid_ = false;
         }
@@ -210,14 +242,14 @@ void FilePlayer::deliver(const EventCD *begin, const EventCD *end) {
     if (abort_buffer_ || begin == end)
         return;
     for (const EventCD *s = begin; s != end;) {
-        const EventCD *e      = s;
-        const timestamp limit = s->t + kSliceUs;
-        while (e != end && e->t < limit)
-            ++e;
-        if (wait_until_due(s->t) == Wait::Abort) {
+        timestamp limit = s->t + kSliceUs;
+        if (wait_until_due(s->t, limit) == Wait::Abort) {
             abort_buffer_ = true;
             return;
         }
+        const EventCD *e = s;
+        while (e != end && e->t < limit)
+            ++e;
         if (events_cb_)
             events_cb_(s, e);
         current_t_ = (e - 1)->t;
@@ -256,6 +288,7 @@ bool FilePlayer::rewind(std::unique_lock<std::mutex> &lock) {
     at_end_     = false;
     current_t_  = min_t;
     pace_valid_ = false;
+    target_.reset();
     lock.unlock();
     if (seek_cb_)
         seek_cb_(min_t);
@@ -300,6 +333,7 @@ void FilePlayer::run() {
                 lock.lock();
             } else {
                 preview_until_.reset();
+                target_.reset();
                 status_ = "Seek unavailable (the RAW index is still being built)";
             }
             continue;

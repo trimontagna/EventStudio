@@ -122,9 +122,12 @@ the CD events), HDF5 exports, CSV exports (`<name>_triggers.csv`: `p,id,t`). Fil
 inputs of a live camera are enabled in Hardware filters > External trigger inputs.
 
 **Preview** modes: CD accumulation, time decay, time surface, event frame histogram, event frame difference,
-events integration; accumulation / decay time, palette, zoom & pan.
+events integration; accumulation / decay time, palette, zoom & pan. Measure tool (M, View menu): click a pixel, then
+another (Shift: horizontal / vertical) for the distance, dx / dy and angle in pixels; step the time in between (arrow
+keys) and the speed in px/ms follows from the times the points were set at. Right click or Esc clears.
 
 **Recordings**: open `.raw` / `.hdf5` / `.dat` (or drop a file on the window), play / pause (Space), seek,
+step with Left / Right (paused, by the Step of the playback bar, 100 µs by default; Shift: one accumulation time),
 speed 0.01x–10x or unpaced, loop.
 
 **Process & export**: re-run a recording through the software filters (optionally a time range) and write

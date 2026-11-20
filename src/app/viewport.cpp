@@ -3,6 +3,7 @@
 
 #include <GLFW/glfw3.h>
 #include <imgui.h>
+#include <imgui_internal.h>
 
 #include "app/app.h"
 #include "app/platform.h"
@@ -44,6 +45,10 @@ ImTextureID tex_id(unsigned int tex) {
 void App::upload_frame() {
     if (!renderer_ || (freeze_ && frame_tex_ != 0))
         return;
+    // Paused seek / step on its way (preroll being decoded): keep the previous image until the view at the target is
+    // complete, rather than flashing the reset or half-accumulated state.
+    if (source_ == SourceKind::File && frame_tex_ != 0 && player_.target_pending())
+        return;
     renderer_->render(preview_time(), rgba_);
     upload_texture(frame_tex_, tex_w_, tex_h_, renderer_->width(), renderer_->height(), rgba_.data(), true);
 }
@@ -81,10 +86,22 @@ void App::draw_preview_window() {
     const ImVec2 avail  = ImGui::GetContentRegionAvail();
     const ImVec2 size   = ImVec2(std::max(avail.x, 16.f), std::max(avail.y - bar_h, 16.f));
     const ImVec2 pos    = ImGui::GetCursorScreenPos();
+    // Button of the measure tool at the top right of the preview (drawn over it below): the preview takes no
+    // click or wheel there
+    const char *measure_label = "Measure (M)";
+    const ImGuiStyle &style   = ImGui::GetStyle();
+    const ImVec2 measure_size(ImGui::CalcTextSize(measure_label).x + style.FramePadding.x * 2, ImGui::GetFrameHeight());
+    const ImVec2 measure_pos(pos.x + size.x - measure_size.x - 8, pos.y + 8);
+    const bool show_measure_button = source_ != SourceKind::None;
+    const bool over_measure_button =
+        show_measure_button && ImGui::IsMouseHoveringRect(measure_pos, ImVec2(measure_pos.x + measure_size.x,
+                                                                              measure_pos.y + measure_size.y));
+    ImGui::SetNextItemAllowOverlap();
     ImGui::InvisibleButton("canvas", size,
                            ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight |
                                ImGuiButtonFlags_MouseButtonMiddle);
-    const bool hovered = ImGui::IsItemHovered();
+    const bool hovered = ImGui::IsItemHovered() && !over_measure_button;
+    const ImVec2 after_canvas = ImGui::GetCursorScreenPos();
 
     // ---- zoom / pan
     const float fit = std::min(size.x / width_, size.y / height_);
@@ -125,7 +142,7 @@ void App::draw_preview_window() {
     dl->AddRect(origin, img_max, IM_COL32(90, 90, 100, 255));
 
     const ViewTransform view{origin, scale};
-    const auto edit = editor_.update(view, hovered, dl);
+    const auto edit = editor_.update(view, hovered && !measure_, dl);
     if (edit.changed || edit.committed)
         masks_changed(edit.committed);
     const auto message = editor_.take_message();
@@ -133,6 +150,8 @@ void App::draw_preview_window() {
         log(message, true);
     if (hovered && editor_.tool() == MaskEditor::Tool::Pixels && editor_.hovered_pixel_x() >= 0)
         draw_pixel_loupe(origin, scale);
+
+    update_measure(view, hovered, dl);
 
     if (show_overlay_)
         draw_overlay(pos, ImVec2(pos.x + size.x, pos.y + size.y));
@@ -158,9 +177,134 @@ void App::draw_preview_window() {
     }
     dl->PopClipRect();
 
+    if (show_measure_button) {
+        ImGui::SetCursorScreenPos(measure_pos);
+        const bool active = measure_;
+        if (active) // highlighted while the tool is on
+            ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+        if (ImGui::Button(measure_label, measure_size))
+            measure_ = !measure_;
+        if (active)
+            ImGui::PopStyleColor();
+        ImGui::SetItemTooltip("Measure distances and pixel speeds on the preview (key M): click a first pixel, then a\n"
+                              "second one (Shift: horizontal / vertical); step the time in between (arrow keys) for\n"
+                              "the speed. Right click or Esc clears. Mask editing is off meanwhile.");
+        ImGui::SetCursorScreenPos(after_canvas);
+    }
+
     if (source_ == SourceKind::File)
         draw_playback_bar();
     ImGui::End();
+}
+
+// Measure tool: click a first point, then a second one (the time may be stepped in between): the distance, its
+// components and angle in pixels and, from the recording time at which each point was set, the pixel speed.
+timestamp App::measure_time() const {
+    return source_ == SourceKind::File ? player_.position() : preview_time();
+}
+
+void App::update_measure(const ViewTransform &view, bool hovered, ImDrawList *dl) {
+    const ImGuiIO &io = ImGui::GetIO();
+    if (!measure_) {
+        measure_points_ = 0;
+        return;
+    }
+    // The pixel under a screen point (its centre), clamped to the sensor.
+    const auto pixel_at = [&](ImVec2 s) {
+        const Vec2 p = view.to_sensor(s);
+        return Vec2{std::clamp(std::floor(p.x), 0.f, static_cast<float>(width_ - 1)) + 0.5f,
+                    std::clamp(std::floor(p.y), 0.f, static_cast<float>(height_ - 1)) + 0.5f};
+    };
+    // Second point: Shift keeps it on the horizontal / vertical of the first one.
+    const auto constrained = [&](Vec2 b) {
+        if (io.KeyShift) {
+            if (std::abs(b.x - measure_a_.x) >= std::abs(b.y - measure_a_.y))
+                b.y = measure_a_.y;
+            else
+                b.x = measure_a_.x;
+        }
+        return b;
+    };
+    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (measure_points_ == 1) {
+            measure_b_      = constrained(pixel_at(io.MousePos));
+            measure_t_b_    = measure_time();
+            measure_points_ = 2;
+        } else {
+            measure_a_      = pixel_at(io.MousePos);
+            measure_t_a_    = measure_time();
+            measure_points_ = 1;
+        }
+    }
+    if ((hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) ||
+        (ImGui::IsWindowFocused() && ImGui::IsKeyPressed(ImGuiKey_Escape, false)))
+        measure_points_ = 0;
+
+    const ImU32 color = IM_COL32(255, 230, 60, 255), dim = IM_COL32(255, 230, 60, 140), shadow = IM_COL32(0, 0, 0, 200);
+    const auto text_box = [&](ImVec2 tp, const char *text) {
+        const ImVec2 ts       = ImGui::CalcTextSize(text);
+        const ImVec2 clip_min = dl->GetClipRectMin(), clip_max = dl->GetClipRectMax();
+        tp.x = std::clamp(tp.x, clip_min.x + 6, std::max(clip_min.x + 6, clip_max.x - ts.x - 6));
+        tp.y = std::clamp(tp.y, clip_min.y + 6, std::max(clip_min.y + 6, clip_max.y - ts.y - 6));
+        dl->AddRectFilled(ImVec2(tp.x - 5, tp.y - 3), ImVec2(tp.x + ts.x + 5, tp.y + ts.y + 3),
+                          IM_COL32(0, 0, 0, 190), 4.f);
+        dl->AddText(tp, color, text);
+    };
+    const auto point = [&](ImVec2 e) {
+        dl->AddCircleFilled(e, 4.f, shadow);
+        dl->AddCircleFilled(e, 3.f, color);
+    };
+    if (hovered) {
+        // the pixel a click would set
+        const Vec2 next = measure_points_ == 1 ? constrained(pixel_at(io.MousePos)) : pixel_at(io.MousePos);
+        const ImVec2 c  = view.to_screen(next);
+        const float r   = std::max(3.f, view.scale * 0.5f);
+        dl->AddRect(ImVec2(c.x - r, c.y - r), ImVec2(c.x + r, c.y + r), color);
+    }
+    const ImVec2 cursor_label(io.MousePos.x + 16, io.MousePos.y + 16);
+    if (measure_points_ == 0) {
+        if (hovered)
+            text_box(cursor_label, "Measure: click the first point");
+        return;
+    }
+    const ImVec2 a = view.to_screen(measure_a_);
+    char buf[320];
+    if (measure_points_ == 1) {
+        if (hovered) {
+            const ImVec2 b = view.to_screen(constrained(pixel_at(io.MousePos)));
+            dl->AddLine(a, b, shadow, 3.f);
+            dl->AddLine(a, b, dim, 1.f);
+        }
+        point(a);
+        std::snprintf(buf, sizeof(buf), "Point 1 (%d, %d) at %s\nClick the second point (step the time first for a speed)",
+                      static_cast<int>(measure_a_.x), static_cast<int>(measure_a_.y),
+                      format_time_us(measure_t_a_, true).c_str());
+        text_box(hovered ? cursor_label : ImVec2(a.x + 12, a.y + 12), buf);
+        return;
+    }
+    const ImVec2 b = view.to_screen(measure_b_);
+    dl->AddLine(a, b, shadow, 4.f);
+    dl->AddLine(a, b, color, 2.f);
+    point(a);
+    point(b);
+    const float dx = measure_b_.x - measure_a_.x, dy = measure_b_.y - measure_a_.y;
+    const float length = std::sqrt(dx * dx + dy * dy);
+    // angle from +x, counterclockwise as seen on screen (sensor y points down)
+    const float angle  = length > 0 ? std::atan2(-dy, dx) * 57.29578f : 0.f;
+    const timestamp dt = measure_t_b_ - measure_t_a_;
+    const int n = std::snprintf(buf, sizeof(buf), "%.1f px   dx %+.0f  dy %+.0f   (%.1f deg)\n(%d, %d) -> (%d, %d)\n",
+                                length, dx, dy, angle, static_cast<int>(measure_a_.x), static_cast<int>(measure_a_.y),
+                                static_cast<int>(measure_b_.x), static_cast<int>(measure_b_.y));
+    if (dt != 0) {
+        // velocity: displacement over the time from point 1 to point 2 (a negative dt reverses it)
+        const double ms = dt * 1e-3, vx = dx / ms, vy = dy / ms, v = length / std::abs(ms);
+        std::snprintf(buf + n, sizeof(buf) - n, "dt %+lld us (%s -> %s)\nspeed %.4g px/ms   vx %+.4g  vy %+.4g px/ms",
+                      static_cast<long long>(dt), format_time_us(measure_t_a_, true).c_str(),
+                      format_time_us(measure_t_b_, true).c_str(), v, vx, vy);
+    } else {
+        std::snprintf(buf + n, sizeof(buf) - n, "dt 0 (both at %s): no speed", format_time_us(measure_t_a_, true).c_str());
+    }
+    text_box(ImVec2((a.x + b.x) / 2 + 12, (a.y + b.y) / 2 + 12), buf);
 }
 
 // Magnified view of the pixels around the cursor, with a pixel grid, for picking pixel masks.
@@ -270,8 +414,8 @@ void App::draw_overlay(const ImVec2 &area_min, const ImVec2 &) {
     } else if (source_ == SourceKind::File) {
         timestamp min_t = 0, max_t = 0;
         const bool has_range = player_.seek_range(min_t, max_t);
-        lines.push_back({"Time         " + format_time_us(player_.current_time()) +
-                             (has_range ? " / " + format_time_us(max_t) : std::string()),
+        lines.push_back({"Time         " + format_time_us(player_.position(), true) +
+                             (has_range ? " / " + format_time_us(max_t, true) : std::string()),
                          normal});
         lines.push_back({"Data rate    " + human_rate(file_bytes_meter_.rate_per_second(now), "B"), normal});
         const double in = in_meter_.rate_per_second(now), out = out_meter_.rate_per_second(now);
@@ -309,6 +453,44 @@ void App::draw_overlay(const ImVec2 &area_min, const ImVec2 &) {
         dl->AddText(ImVec2(p0.x + 8, p0.y + 6 + i * lh), lines[i].second, lines[i].first.c_str());
 }
 
+timestamp App::seek_preroll() const {
+    // Decoding restarts this long before the target, so that the paused view shows the accumulated state there.
+    return std::max(preview_.accumulation_us, preview_.decay_us * 3);
+}
+
+void App::handle_step_keys() {
+    if (source_ != SourceKind::File)
+        return;
+    const ImGuiIO &io = ImGui::GetIO();
+    // Not while typing or using a widget (an active slider takes the arrows), nor while drawing a mask.
+    if (io.WantTextInput || ImGui::IsAnyItemActive() || editor_.drawing())
+        return;
+    // Left / Right belong to the timeline: own them, so that keyboard navigation does not also move the focus.
+    static const ImGuiID owner = ImHashStr("EventStudio timeline keys");
+    ImGui::SetKeyOwner(ImGuiKey_LeftArrow, owner);
+    ImGui::SetKeyOwner(ImGuiKey_RightArrow, owner);
+    const timestamp dt = io.KeyShift ? std::max<timestamp>(1, preview_.accumulation_us) : step_us_;
+    if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, ImGuiInputFlags_Repeat, owner))
+        step_playback(-1, dt);
+    if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, ImGuiInputFlags_Repeat, owner))
+        step_playback(+1, dt);
+}
+
+void App::step_playback(int direction, timestamp dt) {
+    timestamp min_t = 0, max_t = 0;
+    if (!player_.seek_range(min_t, max_t) || max_t <= min_t)
+        return; // RAW index not built yet
+    if (player_.is_playing())
+        player_.pause();
+    const timestamp from = player_.position();
+    const timestamp to   = std::clamp(from + direction * dt, min_t, max_t);
+    if (to == from)
+        return;
+    // Forward: carry on decoding up to the new time; backward (or a seek pending): seek with a preroll.
+    if (direction < 0 || !player_.advance_to(to))
+        player_.request_seek(to, seek_preroll());
+}
+
 void App::draw_playback_bar() {
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 6);
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 3);
@@ -321,18 +503,27 @@ void App::draw_playback_bar() {
     const bool seekable = player_.seek_range(min_t, max_t) && max_t > min_t;
     static timestamp drag_value = 0;
     static bool dragging        = false;
-    timestamp value             = dragging ? drag_value : player_.current_time();
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 190);
+    timestamp value             = dragging ? drag_value : player_.position();
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 300);
     ImGui::BeginDisabled(!seekable);
-    const std::string label = format_time_us(value) + (seekable ? " / " + format_time_us(max_t) : "  (indexing...)");
+    const std::string label =
+        format_time_us(value, true) + (seekable ? " / " + format_time_us(max_t, true) : "  (indexing...)");
     if (ImGui::SliderScalar("##timeline", ImGuiDataType_S64, &value, &min_t, &max_t, label.c_str())) {
         drag_value = value;
-        // Preroll so that the paused view shows the accumulated state at the target time.
-        const timestamp preroll = std::max(preview_.accumulation_us, preview_.decay_us * 3);
-        player_.request_seek(value, preroll);
+        player_.request_seek(value, seek_preroll());
     }
     dragging = ImGui::IsItemActive();
     ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(100);
+    if (ImGui::InputScalar("##step", ImGuiDataType_S64, &step_us_, nullptr, nullptr, "%lld us")) {
+        step_us_ = std::max<timestamp>(1, step_us_);
+        save_app_settings();
+    }
+    ImGui::SetItemTooltip("Step of the Left / Right arrow keys (recording time, microseconds).\n"
+                          "Shift + Left / Right: one accumulation time (%.3g ms, one frame).\n"
+                          "A step pauses playback; the view shows the recording at the new time exactly.",
+                          preview_.accumulation_us / 1000.0);
     ImGui::SameLine();
     static const float speeds[]      = {0.01f, 0.1f, 0.25f, 0.5f, 1.f, 2.f, 5.f, 10.f, 0.f};
     static const char *speed_names[] = {"0.01x", "0.1x", "0.25x", "0.5x", "1x", "2x", "5x", "10x", "Max"};

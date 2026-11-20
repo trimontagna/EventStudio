@@ -57,8 +57,20 @@ public:
     // delivered without pacing, then playback stays paused if it was).
     void request_seek(timestamp t, timestamp preroll_us = 0);
     bool seek_range(timestamp &min_t, timestamp &max_t) const;
+    // Paused step forward to t without seeking: decoding carries on from where it stopped and delivers the events up
+    // to t. False (nothing done) while playing, at the end, with a seek pending or t not ahead: request_seek() then.
+    bool advance_to(timestamp t);
 
+    // Time of the last delivered event.
     timestamp current_time() const { return current_t_; }
+    // Time the view stands at: while paused after a seek / step, its target (exact, even between events), otherwise
+    // current_time().
+    timestamp position() const;
+    // True once the events up to the target of the last seek / step are all delivered (paused): the view then
+    // shows the state at position().
+    bool target_reached() const;
+    // True while paused with a seek / step whose events up to the target are still being delivered.
+    bool target_pending() const;
     int width() const;
     int height() const;
     std::string encoding() const;
@@ -70,7 +82,7 @@ private:
     enum class Wait { Proceed, Abort };
     void run();
     void deliver(const EventCD *begin, const EventCD *end);
-    Wait wait_until_due(timestamp t);
+    Wait wait_until_due(timestamp t, timestamp &limit);
     bool rewind(std::unique_lock<std::mutex> &lock);
     void set_status(std::string s);
     void refresh_seek_range(); // worker thread only, mutex_ not held
@@ -93,6 +105,7 @@ private:
     double speed_ = 1.0;
     std::optional<timestamp> seek_request_;
     std::optional<timestamp> preview_until_;
+    std::optional<timestamp> target_; // target of the last seek / step, until playback resumes
     bool abort_buffer_ = false;
     std::string status_;
 

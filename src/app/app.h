@@ -129,8 +129,13 @@ private:
     void masks_section_pixels();
     void masks_section_polygons();
     void draw_pixel_loupe(const ImVec2 &image_origin, float scale);
+    void update_measure(const ViewTransform &view, bool hovered, ImDrawList *dl);
+    timestamp measure_time() const; // time of the image shown (recording time for a file)
     void draw_preview_window();
     void draw_playback_bar();
+    void handle_step_keys();
+    void step_playback(int direction, timestamp dt); // paused step of the recording by dt (direction -1 / +1)
+    timestamp seek_preroll() const;
     void draw_overlay(const ImVec2 &image_min, const ImVec2 &image_max);
     void draw_log_window();
     void draw_hot_pixel_tool();
@@ -213,12 +218,18 @@ private:
     std::vector<uint8_t> rgba_;
     bool mask_overlay_dirty_ = true;
     bool show_overlay_       = true;
+    // Measure tool: two pixel centres on the preview (sensor coordinates), each with the time it was set at
+    bool measure_            = false;
+    int measure_points_      = 0; // set so far: 0, 1 or 2
+    Vec2 measure_a_, measure_b_;
+    timestamp measure_t_a_ = 0, measure_t_b_ = 0;
     bool show_mask_fill_     = true;
     bool freeze_             = false;
     float zoom_              = 1.f;
     ImVec2 pan_{0, 0};
     float playback_speed_    = 1.f;
     int speed_index_         = 4; // 1x
+    timestamp step_us_       = 100; // Left / Right arrow step (Shift: the accumulation time)
 
     // ---- masks
     MaskSet masks_;

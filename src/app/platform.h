@@ -22,7 +22,7 @@ std::filesystem::path default_output_path(const char *prefix, const char *extens
 std::filesystem::path unique_path(const std::filesystem::path &p);
 std::string human_bytes(double bytes);
 std::string human_rate(double per_second, const char *unit); // "12.3 Mev/s"
-std::string format_time_us(long long us);                    // "00:01:23.456"
+std::string format_time_us(long long us, bool micro = false); // "00:01:23.456" (micro: "00:01:23.456789")
 
 void reveal_in_explorer(const std::filesystem::path &path);
 
