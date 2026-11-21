@@ -1,7 +1,9 @@
 #include "app/app.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <cmath>
 #include <ctime>
 
 #include <imgui.h>
@@ -15,24 +17,14 @@
 
 namespace evs::app {
 
-namespace {
-std::filesystem::path unique_path(std::filesystem::path p) {
-    std::error_code ec;
-    if (!std::filesystem::exists(p, ec))
-        return p;
-    const auto stem = p.stem().string(), ext = p.extension().string();
-    for (int i = 1;; ++i) {
-        auto candidate = p.parent_path() / (stem + "_" + std::to_string(i) + ext);
-        if (!std::filesystem::exists(candidate, ec))
-            return candidate;
-    }
-}
-} // namespace
-
 App::App() {
     refresh_camera_list();
     samples_dir_ = find_samples_dir();
-    record_path_ = to_utf8(default_output_path("recording", ".raw"));
+    {
+        const auto rec = default_output_path("recording", ".raw");
+        record_dir_    = to_utf8(rec.parent_path());
+        record_name_   = to_utf8(rec.stem());
+    }
     export_path_ = to_utf8(default_output_path("export", ".raw"));
     prepare_engine(kDefaultWidth, kDefaultHeight);
     load_app_settings();
@@ -83,6 +75,7 @@ void App::prepare_engine(int width, int height) {
     in_meter_.reset();
     out_meter_.reset();
     file_bytes_meter_.reset();
+    event_history_.reset();
     last_event_t_    = 0;
     last_event_wall_ = 0;
     total_events_    = 0;
@@ -97,6 +90,7 @@ void App::on_events(const EventCD *begin, const EventCD *end) {
         return;
     const timestamp t = (end - 1)->t;
     in_meter_.add(static_cast<double>(end - begin), t);
+    event_history_.add(static_cast<double>(end - begin), source_ == SourceKind::Camera ? LiveCamera::wall_us() : t);
     if (hp_state_ == HotPixelState::Collecting) {
         // live hot pixel measurement: raw input, before the software filters
         std::lock_guard<std::mutex> lock(hp_mutex_);
@@ -145,11 +139,14 @@ void App::on_seek(timestamp t) {
     in_meter_.reset();
     out_meter_.reset();
     file_bytes_meter_.reset();
+    event_history_.reset();
     last_event_t_ = t;
 }
 
 timestamp App::preview_time() const {
     const timestamp last = renderer_->last_timestamp();
+    if (source_ == SourceKind::File && player_.target_reached())
+        return std::max(last, player_.position()); // paused on a seek / step: the view at the target exactly
     if (source_ == SourceKind::Camera && last_event_wall_ > 0 && !freeze_) {
         // Keep the live view moving (and fading) when the sensor is quiet.
         const timestamp idle = LiveCamera::wall_us() - last_event_wall_;
@@ -307,12 +304,21 @@ void App::load_app_settings() {
         return;
     if (const auto last = file.get("last_recording"); last && !last->empty())
         last_recording_ = from_utf8(*last);
+    if (const auto dir = file.get("record_folder"); dir && !dir->empty())
+        record_dir_ = *dir;
+    record_timed_      = file.get_bool("record_timed", record_timed_);
+    record_duration_s_ = std::max(0.1f, file.get_int("record_duration_ms", 10'000) / 1000.f);
+    step_us_           = std::max<timestamp>(1, file.get_int("step_us", step_us_));
 }
 
 void App::save_app_settings() {
     KeyValueFile file;
     file.header = "EventStudio settings (local to this PC)";
     file.set("last_recording", to_utf8(last_recording_));
+    file.set("record_folder", record_dir_);
+    file.set_bool("record_timed", record_timed_);
+    file.set_int("record_duration_ms", std::llround(record_duration_s_ * 1000.0));
+    file.set_int("step_us", step_us_);
     std::string error;
     if (!file.save(app_data_dir() / "settings.ini", &error))
         log("Cannot save the settings: " + error, true);
@@ -376,6 +382,7 @@ void App::open_file(const std::filesystem::path &path) {
     player_.set_raw_bytes_callback(
         [this](size_t n) { file_bytes_meter_.add(static_cast<double>(n), last_event_t_.load()); });
     std::string error;
+    queued_step_.reset();
     if (!player_.open(path, &error)) {
         log("Cannot open " + to_utf8(path) + ": " + error, true);
         return;
@@ -423,10 +430,8 @@ bool App::recording() const {
 void App::start_recording() {
     if (recording() || source_ == SourceKind::None)
         return;
-    std::filesystem::path path = record_path_.empty() ? default_output_path("recording", ".raw") : from_utf8(record_path_);
-    if (path.extension() != ".raw")
-        path += ".raw";
-    path = unique_path(path);
+    // The name box keeps the name: the next recordings of a series get _1, _2... (see record_target()).
+    std::filesystem::path path = unique_path(record_target());
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
     std::string error;
@@ -453,7 +458,7 @@ void App::start_recording() {
     if (source_ == SourceKind::Camera)
         open_latency_log(path);
     last_recording_ = path;
-    record_path_    = to_utf8(path);
+    save_app_settings(); // the folder, the timed recording settings
     log(std::string("Recording ") + (record_mode_ == RecordMode::Raw ? "sensor stream" : "processed stream") + " to " +
         to_utf8(path));
 }
@@ -472,8 +477,38 @@ void App::stop_recording() {
     const auto size = std::filesystem::file_size(last_recording_, ec);
     log("Recording saved: " + to_utf8(last_recording_) + " (" + human_bytes(static_cast<double>(size)) + ")");
     save_app_settings();
-    // Next recording gets a fresh name.
-    record_path_ = to_utf8(unique_path(last_recording_));
+}
+
+double App::recording_elapsed_s() const {
+    return recording() ? std::chrono::duration<double>(std::chrono::steady_clock::now() - record_start_).count() : 0;
+}
+
+std::filesystem::path App::record_target() const {
+    std::string name = record_name_;
+    const char *blanks = " \t";
+    const auto first   = name.find_first_not_of(blanks);
+    const auto last    = name.find_last_not_of(blanks);
+    name             = first == std::string::npos ? std::string() : name.substr(first, last - first + 1);
+    if (name.size() >= 4) {
+        std::string ext = name.substr(name.size() - 4);
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (ext == ".raw")
+            name.resize(name.size() - 4);
+    }
+    if (name.empty() || record_dir_.empty()) {
+        const auto fallback = default_output_path("recording", ".raw");
+        return (record_dir_.empty() ? fallback.parent_path() : from_utf8(record_dir_)) /
+               (name.empty() ? fallback.filename() : from_utf8(name + ".raw"));
+    }
+    return from_utf8(record_dir_) / from_utf8(name + ".raw");
+}
+
+void App::background_tick() {
+    if (record_timed_ && recording() && recording_elapsed_s() >= record_duration_s_) {
+        log("Timed recording: stopped after " + format_time_us(static_cast<long long>(recording_elapsed_s() * 1e6)));
+        stop_recording();
+    }
 }
 
 // ================================================================================================ camera -> PC delay
@@ -885,12 +920,15 @@ void App::frame() {
     if (!io.WantTextInput) {
         if (ImGui::IsKeyPressed(ImGuiKey_Space, false) && source_ == SourceKind::File && !editor_.drawing())
             player_.is_playing() ? player_.pause() : player_.play();
+        if (!io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_M, false) && !editor_.drawing())
+            measure_ = !measure_;
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O, false)) {
             const auto path = open_file_dialog("Open recording", "Event files|*.raw;*.hdf5;*.h5;*.dat|All files|*.*");
             if (!path.empty())
                 open_file(path);
         }
     }
+    handle_step_keys();
 
     draw_menu_bar();
     draw_dockspace();
@@ -996,6 +1034,7 @@ void App::draw_menu_bar() {
         ImGui::MenuItem("Rate overlay", nullptr, &show_overlay_);
         ImGui::MenuItem("Fill masked pixels", nullptr, &show_mask_fill_);
         ImGui::MenuItem("Mask outlines", nullptr, &editor_.show_outlines);
+        ImGui::MenuItem("Measure distances", "M", &measure_);
         if (ImGui::MenuItem("Reset zoom")) {
             zoom_ = 1.f;
             pan_  = ImVec2(0, 0);

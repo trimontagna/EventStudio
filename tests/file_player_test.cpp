@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <fstream>
@@ -135,7 +136,54 @@ TEST_F(FilePlayerTest, SeekWhilePausedShowsTarget) {
     // preroll delivered (paused): events around [target - 10 ms, target], nothing far beyond the target
     EXPECT_LE(events_.front().t, target);
     EXPECT_GE(events_.front().t, target - 200'000);
-    EXPECT_LE(events_.back().t, target + 2000);
+    EXPECT_LE(events_.back().t, target); // up to the target exactly
+}
+
+TEST_F(FilePlayerTest, StepsToTheMicrosecond) {
+    // A seek then paused steps forward (advance_to, no new seek): the events delivered stop at the target exactly,
+    // and the position is the target even between events.
+    timestamp min_t = 0, max_t = 0;
+    ASSERT_TRUE(wait_for([&] { return player_.seek_range(min_t, max_t); }, 30s)) << "RAW index not built";
+    const timestamp target = (min_t + max_t) / 2 + 37;
+    player_.request_seek(target, 5'000);
+    EXPECT_TRUE(player_.target_pending() || player_.target_reached());
+    ASSERT_TRUE(wait_for([&] { return player_.target_reached(); }, 10s));
+    EXPECT_FALSE(player_.target_pending());
+    EXPECT_EQ(player_.position(), target);
+    const auto expected = test::read_all_events(test::data_file(kFile), true);
+    const auto count_up_to = [&](timestamp a, timestamp b) {
+        return static_cast<size_t>(std::count_if(expected.begin(), expected.end(),
+                                                 [&](const EventCD &e) { return e.t >= a && e.t <= b; }));
+    };
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ASSERT_FALSE(events_.empty());
+        EXPECT_LE(events_.back().t, target);
+        EXPECT_EQ(events_.size(), count_up_to(events_.front().t, target));
+    }
+    timestamp first = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        first = events_.front().t;
+    }
+    for (int step = 1; step <= 5; ++step) {
+        const timestamp t = target + step * 100;
+        ASSERT_TRUE(player_.advance_to(t));
+        ASSERT_TRUE(wait_for([&] { return player_.target_reached(); }, 10s));
+        EXPECT_EQ(player_.position(), t);
+        std::lock_guard<std::mutex> lock(mutex_);
+        EXPECT_LE(events_.back().t, t);
+        EXPECT_EQ(events_.size(), count_up_to(first, t)) << "step " << step;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        EXPECT_EQ(seeks_.size(), 1u); // the steps did not seek
+        EXPECT_EQ(order_violations_, 0);
+    }
+    EXPECT_FALSE(player_.advance_to(target)); // backward: needs a seek
+    EXPECT_FALSE(player_.is_playing());
+    player_.play();
+    EXPECT_EQ(player_.position(), player_.current_time()); // playing: the target is dropped
 }
 
 TEST_F(FilePlayerTest, QueriesFromAnotherThreadNeverBlockPlayback) {

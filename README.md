@@ -45,11 +45,15 @@ C:\Dev\
 |---|---|
 | `build.bat [target]` | Configures (first time) and builds into `build\` (Release, with PDBs) |
 | `run_tests.bat [gtest args]` | Runs the unit / integration tests (`build\Release\evs_tests.exe`) |
-| `EventStudio.bat [file] [--masks file.masks]` | Starts the application, optionally opening a recording |
+| `EventStudio.bat [file] [--masks file.masks] [--console]` | Starts the application, optionally opening a recording |
 
 `EventStudio.exe` must run with the OpenEB environment (`EventStudio.bat` sets it): it loads the OpenEB DLLs and
 camera plugins from the OpenEB build tree. Integration tests use the OpenEB test datasets in
 `C:\Dev\OpenEB_tests\openeb` (`EVS_TEST_DATA_DIR` in `build.bat`); without them those tests are skipped.
+
+Double-clicked, `EventStudio.bat` waits for the application: its console window is hidden once EventStudio starts and
+closed when it ends (also in Windows Terminal, whatever its `closeOnExit` setting). Run from a terminal (cmd, PowerShell),
+the terminal is left as it is and its prompt comes back when EventStudio closes; `--console` keeps the window.
 
 ## Features
 
@@ -118,9 +122,12 @@ the CD events), HDF5 exports, CSV exports (`<name>_triggers.csv`: `p,id,t`). Fil
 inputs of a live camera are enabled in Hardware filters > External trigger inputs.
 
 **Preview** modes: CD accumulation, time decay, time surface, event frame histogram, event frame difference,
-events integration; accumulation / decay time, palette, zoom & pan.
+events integration; accumulation / decay time, palette, zoom & pan. Measure tool (M, View menu): click a pixel, then
+another (Shift: horizontal / vertical) for the distance, dx / dy and angle in pixels; step the time in between (arrow
+keys) and the speed in px/ms follows from the times the points were set at. Right click or Esc clears.
 
 **Recordings**: open `.raw` / `.hdf5` / `.dat` (or drop a file on the window), play / pause (Space), seek,
+step with Left / Right (paused, by the Step of the playback bar, 100 µs by default; Shift: one accumulation time),
 speed 0.01x–10x or unpaced, loop.
 
 **Process & export**: re-run a recording through the software filters (optionally a time range) and write

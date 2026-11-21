@@ -117,6 +117,18 @@ std::filesystem::path app_data_dir() {
     return std::filesystem::temp_directory_path(ec) / L"EventStudio";
 }
 
+std::filesystem::path unique_path(const std::filesystem::path &p) {
+    std::error_code ec;
+    if (!std::filesystem::exists(p, ec))
+        return p;
+    const std::wstring stem = p.stem().wstring(), ext = p.extension().wstring();
+    for (int i = 1;; ++i) {
+        auto candidate = p.parent_path() / (stem + L"_" + std::to_wstring(i) + ext);
+        if (!std::filesystem::exists(candidate, ec))
+            return candidate;
+    }
+}
+
 std::filesystem::path default_output_path(const char *prefix, const char *extension) {
     std::filesystem::path dir;
     if (const char *profile = std::getenv("USERPROFILE"))
@@ -157,13 +169,17 @@ std::string human_rate(double per_second, const char *unit) {
     return buf;
 }
 
-std::string format_time_us(long long us) {
+std::string format_time_us(long long us, bool micro) {
     const bool neg = us < 0;
     if (neg)
         us = -us;
     const long long ms = us / 1000, s = ms / 1000, m = s / 60, h = m / 60;
     char buf[48];
-    std::snprintf(buf, sizeof(buf), "%s%02lld:%02lld:%02lld.%03lld", neg ? "-" : "", h, m % 60, s % 60, ms % 1000);
+    if (micro)
+        std::snprintf(buf, sizeof(buf), "%s%02lld:%02lld:%02lld.%06lld", neg ? "-" : "", h, m % 60, s % 60,
+                      us % 1'000'000);
+    else
+        std::snprintf(buf, sizeof(buf), "%s%02lld:%02lld:%02lld.%03lld", neg ? "-" : "", h, m % 60, s % 60, ms % 1000);
     return buf;
 }
 
