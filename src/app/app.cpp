@@ -382,6 +382,7 @@ void App::open_file(const std::filesystem::path &path) {
     player_.set_raw_bytes_callback(
         [this](size_t n) { file_bytes_meter_.add(static_cast<double>(n), last_event_t_.load()); });
     std::string error;
+    queued_step_.reset();
     if (!player_.open(path, &error)) {
         log("Cannot open " + to_utf8(path) + ": " + error, true);
         return;

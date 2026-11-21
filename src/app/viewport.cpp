@@ -459,8 +459,19 @@ timestamp App::seek_preroll() const {
 }
 
 void App::handle_step_keys() {
-    if (source_ != SourceKind::File)
+    if (source_ != SourceKind::File) {
+        queued_step_.reset();
         return;
+    }
+    // A step queued while a seek was on its way (arrow held): send it now that the view at that seek is shown.
+    if (queued_step_ && player_.is_playing())
+        queued_step_.reset();
+    if (queued_step_ && !player_.target_pending()) {
+        const timestamp t = *queued_step_;
+        queued_step_.reset();
+        if (t <= player_.position() || !player_.advance_to(t))
+            player_.request_seek(t, seek_preroll());
+    }
     const ImGuiIO &io = ImGui::GetIO();
     // Not while typing or using a widget (an active slider takes the arrows), nor while drawing a mask.
     if (io.WantTextInput || ImGui::IsAnyItemActive() || editor_.drawing())
@@ -482,13 +493,21 @@ void App::step_playback(int direction, timestamp dt) {
         return; // RAW index not built yet
     if (player_.is_playing())
         player_.pause();
-    const timestamp from = player_.position();
+    const timestamp from = queued_step_.value_or(player_.position());
     const timestamp to   = std::clamp(from + direction * dt, min_t, max_t);
     if (to == from)
         return;
-    // Forward: carry on decoding up to the new time; backward (or a seek pending): seek with a preroll.
-    if (direction < 0 || !player_.advance_to(to))
-        player_.request_seek(to, seek_preroll());
+    // Forward: carry on decoding up to the new time.
+    if (direction > 0 && !queued_step_ && player_.advance_to(to))
+        return;
+    // A seek still on its way (key held: repeats come faster than a seek with its preroll): queue the step rather than
+    // restart the seek, which would keep the view pending (and the previous image shown) until the key is released.
+    if (player_.target_pending()) {
+        queued_step_ = to;
+        return;
+    }
+    // Backward: seek with a preroll.
+    player_.request_seek(to, seek_preroll());
 }
 
 void App::draw_playback_bar() {
@@ -510,6 +529,7 @@ void App::draw_playback_bar() {
         format_time_us(value, true) + (seekable ? " / " + format_time_us(max_t, true) : "  (indexing...)");
     if (ImGui::SliderScalar("##timeline", ImGuiDataType_S64, &value, &min_t, &max_t, label.c_str())) {
         drag_value = value;
+        queued_step_.reset();
         player_.request_seek(value, seek_preroll());
     }
     dragging = ImGui::IsItemActive();

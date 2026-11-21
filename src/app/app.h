@@ -5,6 +5,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -230,6 +231,8 @@ private:
     float playback_speed_    = 1.f;
     int speed_index_         = 4; // 1x
     timestamp step_us_       = 100; // Left / Right arrow step (Shift: the accumulation time)
+    // Step asked while a seek was still on its way (key held): sent once that seek has landed, the latest wins
+    std::optional<timestamp> queued_step_;
 
     // ---- masks
     MaskSet masks_;
